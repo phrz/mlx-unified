@@ -1031,16 +1031,31 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
-            # mlx-unified: multimodal requests skip the token-keyed prompt cache
-            # entirely (two different images expand to identical placeholder
-            # tokens — a token-keyed hit would silently serve the wrong image)
-            # and inject the merged embeddings + multimodal rope state instead.
+            # mlx-unified: multimodal requests get their OWN cache namespace, keyed by
+            # every image referenced so far in the conversation (order-sensitive) —
+            # ape mlx-engine's approach rather than bypassing the cache outright. Two
+            # different images expand to IDENTICAL placeholder tokens, so a plain
+            # token-keyed hit would silently serve the wrong image; namespacing by an
+            # image fingerprint (in addition to the token prefix) keeps that
+            # impossible while still letting a follow-up turn that repeats the same
+            # image(s) reuse the cached prefix through ordinary prefix matching — the
+            # trie (cache.py's PromptTrie) treats the key as an opaque hashable, so a
+            # wider tuple key needs no changes there.
             vision = getattr(request, "vision", None)
             generate_kwargs = {}
             if vision is not None:
-                rest = prompt
-                cache = make_prompt_cache(self.model_provider.model)
-                cache_key = None
+                image_model_key = (*self.model_provider.model_key, "vision", vision.image_fingerprint)
+                self._log_cache_stats()
+                cache, rest = self.prompt_cache.fetch_nearest_cache(image_model_key, prompt)
+                trimmed = len(prompt) - len(rest)
+                ctx.prompt_cache_count = trimmed
+                cache_key = prompt[:]
+                if cache is None:
+                    cache = make_prompt_cache(self.model_provider.model)
+                # Keep every per-position array (embeddings/rope positions/token
+                # types) aligned with `rest` — a cache hit means only a TAIL of the
+                # original prompt is actually being prefilled now.
+                vision = vision.sliced(trimmed)
                 generate_kwargs["input_embeddings"] = vision.embeddings
                 if vision.position_ids is not None:
                     # qwen-family: 3D multimodal rope side state (see models/qwen3_5.py)
@@ -1071,10 +1086,11 @@ class ResponseGenerator:
                         cache += make_prompt_cache(self.model_provider.draft_model)
 
             # An image span must never be split across prefill chunks (gemma4
-            # bidirectional masks are built per forward) — widen to one call.
+            # bidirectional masks are built per forward) — widen to cover whatever's
+            # actually left to prefill (a cache hit may have trimmed the span away).
             prefill_step_size = self.cli_args.prefill_step_size
             if vision is not None and vision.single_prefill:
-                prefill_step_size = max(len(prompt), prefill_step_size)
+                prefill_step_size = max(len(rest), prefill_step_size)
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1121,11 +1137,12 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again (never for multimodal prompts — see above)
+            # Save the KV cache again, into the vision-namespaced key when this was a
+            # multimodal request (see above) so a later turn that repeats the same
+            # image(s) can find it.
             if cache_key is not None:
-                self.prompt_cache.insert_cache(
-                    self.model_provider.model_key, cache_key, cache
-                )
+                insert_key = image_model_key if vision is not None else self.model_provider.model_key
+                self.prompt_cache.insert_cache(insert_key, cache_key, cache)
 
         except Exception as e:
             rqueue.put(e)

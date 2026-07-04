@@ -29,9 +29,10 @@
 
 import base64
 import binascii
+import hashlib
 import io
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -83,6 +84,15 @@ def images_from_message_content(content) -> List[str]:
     return out
 
 
+def image_fingerprint(images: List[str]) -> str:
+    """A stable identity for an ORDERED list of image payloads — hashing the raw
+    payload strings directly (not the decoded pixels) is cheap and exactly as
+    deterministic: same input string, same hash, every time. A NUL separator can't
+    appear in base64/data-URI/URL text, so no ambiguity between e.g. ["ab","c"] and
+    ["a","bc"]."""
+    return hashlib.sha256("\x00".join(images).encode()).hexdigest()
+
+
 def decode_image(payload: str):
     """An OpenAI image payload (data URI, raw base64, or http(s) URL) → PIL image."""
     from PIL import Image
@@ -113,6 +123,30 @@ class VisionPrompt:
     mm_token_type_ids: Optional[mx.array] = None  # (1, L): 0 text / 1 image / 2 video / 3 audio
     per_layer_token_ids: Optional[List[int]] = None  # ids with image positions zeroed (E2B/E4B)
     single_prefill: bool = False  # image span must sit in ONE prefill forward
+    # A stable fingerprint of every image referenced so far in this conversation (not
+    # just a new one this turn) — same images in the same order → same fingerprint, so
+    # a follow-up turn's KV cache lookup lands in the SAME trie namespace and can reuse
+    # the cached prefix through fetch_nearest_cache's normal token-prefix matching.
+    # ANY difference in the image set (new/different/reordered images) changes the
+    # fingerprint, landing in a fresh, isolated namespace — a stale cache from a
+    # different image can never be served (see server.py's _serve_single).
+    image_fingerprint: str = ""
+
+    def sliced(self, keep_from: int) -> "VisionPrompt":
+        """This prompt with its first `keep_from` positions dropped — for when
+        fetch_nearest_cache finds a cached prefix and only a tail needs prefill.
+        All per-position state (embeddings/positions/token types) must stay aligned
+        with the trimmed token list, or the model reads misaligned vision state."""
+        if keep_from <= 0:
+            return self
+        return replace(
+            self,
+            tokens=self.tokens[keep_from:],
+            embeddings=self.embeddings[keep_from:],
+            position_ids=self.position_ids[:, :, keep_from:] if self.position_ids is not None else None,
+            mm_token_type_ids=self.mm_token_type_ids[:, keep_from:] if self.mm_token_type_ids is not None else None,
+            per_layer_token_ids=self.per_layer_token_ids[keep_from:] if self.per_layer_token_ids else None,
+        )
 
 
 class MlxVlmBridge:
@@ -270,6 +304,7 @@ class MlxVlmBridge:
             mm_token_type_ids=mm_token_type_ids,
             per_layer_token_ids=per_layer_token_ids,
             single_prefill=single_prefill,
+            image_fingerprint=image_fingerprint(images),
         )
 
 
