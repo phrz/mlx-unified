@@ -215,6 +215,12 @@ class DecoderLayer(nn.Module):
             self.linear_attn = GatedDeltaNet(args)
         else:
             self.self_attn = Attention(args)
+            # Multimodal RoPE support (mlx-unified): built lazily on the first vision
+            # call — text-only use never imports mlx-vlm. Underscore attrs so MLX's
+            # module walker doesn't register them (no weights to load/quantize).
+            self._mrope = None
+            self._rope_parameters = args.rope_parameters
+            self._max_position_embeddings = args.max_position_embeddings
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -231,14 +237,83 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         if self.is_linear:
+            # GatedDeltaNet is position-free — identical for text and vision.
             r = self.linear_attn(self.input_layernorm(x), mask, cache)
-        else:
+        elif position_ids is None:
+            # Text-only: the original Qwen3NextAttention with plain nn.RoPE
+            # (mrope with equal t/h/w axes degenerates to exactly this).
             r = self.self_attn(self.input_layernorm(x), mask, cache)
+        else:
+            # Vision: 3D multimodal RoPE over the SAME attention weights.
+            r = self._mrope_attention(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
+
+    def _mrope_attention(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: mx.array,
+    ) -> mx.array:
+        """MRoPE attention path reusing self.self_attn's weights.
+
+        Mirrors Qwen3_5Attention.__call__ from mlx-vlm; adapted from
+        lmstudio-ai/mlx-engine's qwen3_5 patch (MIT) — in this fork it is
+        first-class rather than a monkeypatch.
+        """
+        # Heavy deps only on the vision path; text-only never reaches here.
+        from mlx_vlm.models.qwen3_5.language import (
+            Qwen3_5RotaryEmbedding,
+            apply_multimodal_rotary_pos_emb,
+        )
+
+        from .base import scaled_dot_product_attention
+
+        if self._mrope is None:
+            rope_params = self._rope_parameters
+            self._mrope = Qwen3_5RotaryEmbedding(
+                int(self.self_attn.head_dim * rope_params["partial_rotary_factor"]),
+                max_position_embeddings=self._max_position_embeddings,
+                base=rope_params["rope_theta"],
+                mrope_section=rope_params["mrope_section"],
+            )
+
+        attn = self.self_attn
+        B, L, D = x.shape
+
+        q_proj_output = attn.q_proj(x)
+        queries, gate = mx.split(
+            q_proj_output.reshape(B, L, attn.num_attention_heads, -1), 2, axis=-1
+        )
+        gate = gate.reshape(B, L, -1)
+
+        keys, values = attn.k_proj(x), attn.v_proj(x)
+
+        queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = attn.k_norm(keys.reshape(B, L, attn.num_key_value_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        values = values.reshape(B, L, attn.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+
+        cos, sin = self._mrope(values, position_ids)
+        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=attn.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+        return attn.o_proj(output * mx.sigmoid(gate))
 
 
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
@@ -251,6 +326,99 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
+        # Multimodal RoPE side state (mlx-unified), set by the vision path before
+        # generation and cleared afterwards. Underscore attrs so MLX's module walker
+        # never registers them as parameters. Ported from lmstudio-ai/mlx-engine's
+        # qwen3_5 patch (MIT), here as first-class code.
+        self._mm_position_ids = None
+        self._mm_rope_deltas = None
+
+    def set_mrope_state(self, position_ids: mx.array, rope_deltas: mx.array) -> None:
+        """Install 3D multimodal positions (3, B, L) + rope delta for a vision prompt."""
+        self._mm_position_ids = position_ids
+        self._mm_rope_deltas = rope_deltas
+
+    def reset_mrope_state(self) -> None:
+        self._mm_position_ids = None
+        self._mm_rope_deltas = None
+
+    def _compute_position_ids(self, inputs: mx.array, cache) -> Optional[mx.array]:
+        """Positions for the current forward pass from stored multimodal state.
+
+        None (the common text-only case) routes every layer to the original
+        1D-RoPE path. During chunked prefill the stored prompt positions are
+        sliced by cache offset (stitching a sequential tail if a chunk crosses
+        the end); once the prompt is exhausted, decode positions are
+        cache_offset + rope_delta broadcast to all three mrope axes.
+        """
+        if self._mm_position_ids is None and self._mm_rope_deltas is None:
+            return None
+        if self._mm_position_ids is not None and self._mm_rope_deltas is None:
+            raise ValueError(
+                "MRoPE state is inconsistent: position_ids set without rope_deltas."
+            )
+        if self.fa_idx is None:
+            raise ValueError("multimodal generation is unsupported with pipelining")
+
+        cache_offset = 0
+        cache_offset_scalar = 0
+        if cache is not None and cache[self.fa_idx] is not None:
+            offset = cache[self.fa_idx].offset
+            if isinstance(offset, int):
+                cache_offset = offset
+                cache_offset_scalar = offset
+            elif isinstance(offset, mx.array) and offset.ndim == 0:
+                cache_offset = offset.item()
+                cache_offset_scalar = cache_offset
+            elif isinstance(offset, mx.array):
+                cache_offset = offset
+                cache_offset_scalar = offset[0].item()
+
+        batch_size, seq_length = inputs.shape
+
+        if self._mm_position_ids is not None:
+            stored_seq_length = self._mm_position_ids.shape[2]
+            if cache_offset_scalar < stored_seq_length:
+                stored_end = min(cache_offset_scalar + seq_length, stored_seq_length)
+                stored_positions = self._mm_position_ids[
+                    :, :, cache_offset_scalar:stored_end
+                ]
+                if stored_end - cache_offset_scalar == seq_length:
+                    return stored_positions
+                tail_positions = self._sequential_position_ids(
+                    batch_size=batch_size,
+                    seq_length=seq_length - (stored_end - cache_offset_scalar),
+                    start_offset=stored_seq_length,
+                )
+                return mx.concatenate([stored_positions, tail_positions], axis=2)
+
+        return self._sequential_position_ids(
+            batch_size=batch_size, seq_length=seq_length, start_offset=cache_offset
+        )
+
+    def _sequential_position_ids(
+        self, *, batch_size: int, seq_length: int, start_offset
+    ) -> mx.array:
+        delta = mx.array(start_offset)
+        if self._mm_rope_deltas is not None:
+            delta = delta + self._mm_rope_deltas
+
+        position_ids = mx.arange(seq_length).reshape(1, -1)
+        position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
+
+        if delta.ndim == 0:
+            delta = mx.broadcast_to(delta.reshape(1, 1), (batch_size, 1))
+        elif delta.ndim == 1:
+            delta = delta[:batch_size].reshape(-1, 1)
+            if delta.shape[0] == 1 and batch_size > 1:
+                delta = mx.broadcast_to(delta, (batch_size, 1))
+        else:
+            delta = delta[:batch_size]
+            if delta.shape[0] == 1 and batch_size > 1:
+                delta = mx.broadcast_to(delta, (batch_size, delta.shape[1]))
+
+        position_ids = mx.add(position_ids, delta)[None, ...]
+        return mx.broadcast_to(position_ids, (3, batch_size, seq_length))
 
     def pipeline(self, group):
         super().pipeline(group)
@@ -281,6 +449,9 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
 
+        # None for text-only requests — layers take the original 1D-RoPE path.
+        position_ids = self._compute_position_ids(inputs, cache)
+
         fa_mask = None
         ssm_mask = None
         if self.fa_idx is not None:
@@ -294,7 +465,9 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
 
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c, position_ids=position_ids
+            )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:

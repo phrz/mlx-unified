@@ -42,8 +42,9 @@ from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
 )
+from .multimodal import images_from_message_content, load_vision_encoder
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import _parse_size, load, sharded_load
+from .utils import _download, _parse_size, load, sharded_load
 
 
 def get_system_fingerprint():
@@ -131,9 +132,21 @@ def process_message_content(messages):
         ValueError: If the 'content' type is not supported or if 'text' is missing.
 
     """
+    images = []
     for message in messages:
         content = message.get("content")
         if isinstance(content, list):
+            msg_images = images_from_message_content(content)
+            if msg_images:
+                # Multimodal message: keep the structured content-part list (with
+                # image_url parts normalized to {"type": "image"}) so the model's
+                # chat template renders its image placeholder tokens in place.
+                images.extend(msg_images)
+                message["content"] = [
+                    {"type": "image"} if part.get("type") == "image_url" else part
+                    for part in content
+                ]
+                continue
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
             ]
@@ -148,6 +161,7 @@ def process_message_content(messages):
                 if func := tool_call.get("function"):
                     if args := func.get("arguments"):
                         func["arguments"] = json.loads(args)
+    return images
 
 
 @dataclass
@@ -203,6 +217,19 @@ class CompletionRequest:
     messages: List[Any]
     tools: Optional[List[Any]]
     role_mapping: Optional[Dict[str, Any]]
+
+    # mlx-unified: the processed multimodal prompt (a multimodal.VisionPrompt),
+    # populated by _tokenize when the request's messages carry images.
+    vision: Optional[Any] = None
+
+
+def request_has_images(request) -> bool:
+    """Cheap pre-tokenize check used to route image requests off the batched path."""
+    if request.request_type != "chat":
+        return False
+    return any(
+        images_from_message_content(m.get("content")) for m in (request.messages or [])
+    )
 
 
 @dataclass
@@ -373,12 +400,22 @@ class ModelProvider:
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
 
+        # Vision components (mlx-unified): present only for supported VLM
+        # checkpoints; None means the server behaves exactly like stock mlx-lm.
+        vision_encoder = None
+        if not self.is_distributed:
+            try:
+                vision_encoder = load_vision_encoder(_download(model_path))
+            except Exception as e:
+                logging.warning(f"Vision support unavailable for {model_path}: {e}")
+
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
         self.is_batchable = is_batchable
+        self.vision_encoder = vision_encoder
 
     def load_default(self):
         if self._model_map["default_model"] is not None:
@@ -533,7 +570,7 @@ class ResponseGenerator:
             role_mapping = request.role_mapping
 
             if tokenizer.has_chat_template:
-                process_message_content(messages)
+                images = process_message_content(messages)
                 if tools and not tokenizer.has_tool_calling:
                     logging.warning(
                         "Received tools but model does not support tool calling. "
@@ -550,6 +587,36 @@ class ResponseGenerator:
                     tokenize=True,
                     **chat_template_args,
                 )
+                if images:
+                    # mlx-unified: render the template as TEXT (image placeholder
+                    # tokens included), then let the vision encoder expand the
+                    # placeholders per patch and build the merged embeddings.
+                    encoder = self.model_provider.vision_encoder
+                    if encoder is None:
+                        raise ValueError(
+                            "This model does not support image input "
+                            "(no vision components for this checkpoint)."
+                        )
+                    if self.model_provider.draft_model is not None:
+                        raise ValueError(
+                            "Image input is not supported with a draft model."
+                        )
+                    rendered = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        **{**template_kwargs, "tokenize": False},
+                    )
+                    request.vision = encoder.prepare(
+                        rendered, images, self.model_provider.model.model.embed_tokens
+                    )
+                    prompt = request.vision.tokens
+                    initial_state = "normal"
+                    if tokenizer.has_thinking:
+                        think_start = tokenizer.rfind_think_start(prompt)
+                        think_end = tokenizer.rfind_think_end(prompt)
+                        if think_start > think_end:
+                            initial_state = "reasoning"
+                    return prompt, [prompt], ["assistant"], initial_state
                 prompt = tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
@@ -682,8 +749,14 @@ class ResponseGenerator:
 
         return sm, sequences
 
-    def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+    def _is_batchable(self, request, args):
+        # Image requests take the sequential path: BatchGenerator has no
+        # input_embeddings support, and multimodal positions are per-request state.
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and not request_has_images(request)
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -732,7 +805,7 @@ class ResponseGenerator:
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and self._is_batchable(args)
+                    and self._is_batchable(request, args)
                 ):
                     try:
                         prompt, segments, segment_types, initial_state = self._tokenize(
@@ -810,7 +883,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    if not self._is_batchable(request, args):
                         self._serve_single((rqueue, request, args))
                         continue
 
@@ -960,17 +1033,30 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
-            # Load the KV cache
-            self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
-            cache_key = prompt[:]
-            if cache is None:
+            # mlx-unified: multimodal requests skip the token-keyed prompt cache
+            # entirely (two different images expand to identical placeholder
+            # tokens — a token-keyed hit would silently serve the wrong image)
+            # and inject the merged embeddings + multimodal rope state instead.
+            vision = getattr(request, "vision", None)
+            generate_kwargs = {}
+            if vision is not None:
+                rest = prompt
                 cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+                cache_key = None
+                generate_kwargs["input_embeddings"] = vision.embeddings
+                model.model.set_mrope_state(vision.position_ids, vision.rope_deltas)
+            else:
+                # Load the KV cache
+                self._log_cache_stats()
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                ctx.prompt_cache_count = len(prompt) - len(rest)
+                cache_key = prompt[:]
+                if cache is None:
+                    cache = make_prompt_cache(self.model_provider.model)
+                    if self.model_provider.draft_model is not None:
+                        cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -985,6 +1071,7 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                **generate_kwargs,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1003,7 +1090,8 @@ class ResponseGenerator:
                         ),
                     )
                 )
-                cache_key.append(gen.token)
+                if cache_key is not None:
+                    cache_key.append(gen.token)
 
                 if ctx._should_stop:
                     if self._is_distributed:
@@ -1015,13 +1103,17 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            # Save the KV cache again (never for multimodal prompts — see above)
+            if cache_key is not None:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
+        finally:
+            if getattr(request, "vision", None) is not None:
+                self.model_provider.model.model.reset_mrope_state()
 
     def generate(
         self,

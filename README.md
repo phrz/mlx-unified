@@ -1,3 +1,36 @@
+# mlx-unified
+
+A fork of [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) whose
+`mlx_lm.server` accepts OpenAI-style **image** content parts. The approach
+follows [lmstudio-ai/mlx-engine](https://github.com/lmstudio-ai/mlx-engine)
+(MIT): the text model is always mlx-lm's own — for every model, vision or not —
+and [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) contributes only its vision
+components. Images are encoded by the checkpoint's vision tower, spliced into
+the text-token embeddings at placeholder positions, and injected into
+generation via mlx-lm's `input_embeddings`, with faithful multimodal RoPE
+(3D grid positions for image spans) rather than a 1D approximation.
+
+One text implementation, no duplicated code paths, no separate VLM server.
+
+```sh
+uv tool install "mlx-lm[vision] @ git+https://github.com/phrz/mlx-unified"
+mlx_lm.server --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8080
+# then POST /v1/chat/completions with {"type":"image_url", ...} content parts
+```
+
+Supported vision architectures: `qwen3_5`, `qwen3_5_moe` (grown per-arch, like
+mlx-engine — contributions welcome). Text-only checkpoints and requests behave
+byte-identically to upstream mlx-lm; without the `[vision]` extra this IS
+upstream mlx-lm plus dormant hooks. The diff over upstream is deliberately
+small and additive to keep rebasing cheap: `mlx_lm/multimodal.py` (new),
+vision hooks in `mlx_lm/server.py`, and an MRoPE path in
+`mlx_lm/models/qwen3_5.py` (adapted from mlx-engine's qwen3_5 patch, MIT
+© LM Studio, here as first-class code instead of a monkeypatch).
+
+Upstream README follows.
+
+---
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
