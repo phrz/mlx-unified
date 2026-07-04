@@ -1,44 +1,67 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
 #
-# Qwen2-VL / Qwen2.5-VL text model with 3D multimodal RoPE side state (mlx-unified).
-# The rope math is ported from Blaizzy/mlx-vlm's models/qwen2_vl/language.py and
-# models/rope_utils.py (MIT © Blaizzy/mlx-vlm contributors): Qwen2-VL's
-# sectioned-half-split mrope rotates the FULL head_dim, with mrope_section chunks of
-# the frequency half assigned to the (t, h, w) position axes — unlike qwen3_5's
-# partial-rotary interleaved layout. Selecting the axis per frequency before cos/sin
-# (mlx-vlm's "chunked" style) is numerically identical to sectioning precomputed
-# cos/sin at Q/K application ("sectioned_half_split") and needs no per-layer state.
+# Tencent Hunyuan-VL text model with 4-axis "xdrope" multimodal RoPE side state
+# (mlx-unified). The rope math is ported from Blaizzy/mlx-vlm's
+# models/hunyuan_vl/language.py (MIT © Blaizzy/mlx-vlm contributors): the
+# NTK-alpha-scaled frequency half is split into xdrope_section chunks (default
+# [16, 16, 16, 16]) whose frequencies read the (p, w, h, t) position axes — the
+# processor's axis order, which is what mlx-vlm actually feeds at runtime (its
+# language.py fallback stacks [p, t, h, w]; the processor wins in prepare_inputs).
+# The p axis stays the raw sequential index everywhere, so equal axes degenerate
+# to exactly the DynamicNTKAlphaRoPE 1D rope that hunyuan_v1_dense uses, and
+# decode positions are plain cache offsets (rope delta 0 — hunyuan never
+# compresses positions after an image span).
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
+from .hunyuan_v1_dense import DynamicNTKAlphaRoPE
 
 
 @dataclass
 class TextModelArgs(BaseModelArgs):
-    model_type: str = "qwen2_vl"
-    hidden_size: int = 1536
-    num_hidden_layers: int = 28
-    intermediate_size: int = 8960
-    num_attention_heads: int = 12
-    rms_norm_eps: float = 1e-6
-    vocab_size: int = 151936
+    model_type: str = "hunyuan_vl"
+    vocab_size: int = 120818
+    hidden_size: int = 1024
+    num_hidden_layers: int = 24
+    intermediate_size: int = 3584
+    num_attention_heads: int = 16
     num_key_value_heads: Optional[int] = None
+    head_dim: Optional[int] = None
+    attention_bias: bool = False
+    mlp_bias: bool = False
+    use_qk_norm: bool = True
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+    rope_scaling: Optional[Dict[str, Union[float, int, bool, str, List[int]]]] = field(
+        default_factory=lambda: {
+            "type": "xdrope",
+            "alpha": 1000.0,
+            "xdrope_section": [16, 16, 16, 16],
+        }
+    )
     max_position_embeddings: int = 32768
-    rope_theta: float = 1000000.0
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str, list]]] = None
-    tie_word_embeddings: bool = False
+    tie_word_embeddings: bool = True
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+
+
+def _scaled_rope_base(args: TextModelArgs) -> float:
+    """rope_theta with hunyuan's NTK-alpha scaling (applies to xdrope too)."""
+    scaling = args.rope_scaling or {}
+    alpha = scaling.get("alpha")
+    if scaling.get("type") in ("xdrope", "dynamic") and alpha:
+        return args.rope_theta * alpha ** (args.head_dim / (args.head_dim - 2))
+    return args.rope_theta
 
 
 def _rotate_half(x):
@@ -46,11 +69,12 @@ def _rotate_half(x):
     return mx.concatenate([-x[..., mid:], x[..., :mid]], axis=-1)
 
 
-def _mrope_cos_sin(position_ids, inv_freq, axis_selector):
-    """(3, B, L) positions -> half-split cos/sin of shape (B, 1, L, head_dim).
+def _xdrope_cos_sin(position_ids, inv_freq, axis_selector):
+    """(num_axes, B, L) positions -> half-split cos/sin of shape (B, 1, L, head_dim).
 
-    Each frequency index reads the position axis its mrope_section chunk names;
-    duplicating the half then matches _rotate_half's (d, d + dim/2) pairing.
+    Each frequency index reads the position axis its xdrope_section chunk names;
+    duplicating the half then matches _rotate_half's (d, d + dim/2) pairing —
+    numerically identical to mlx-vlm's split-and-reassemble of precomputed cos/sin.
     """
     positions = mx.take(position_ids, axis_selector, axis=0).transpose(1, 2, 0)
     angles = positions.astype(mx.float32) * inv_freq
@@ -58,7 +82,7 @@ def _mrope_cos_sin(position_ids, inv_freq, axis_selector):
     return mx.cos(angles)[:, None], mx.sin(angles)[:, None]
 
 
-def _apply_mrope(queries, keys, cos, sin):
+def _apply_xdrope(queries, keys, cos, sin):
     q = queries.astype(mx.float32)
     k = keys.astype(mx.float32)
     q = q * cos + _rotate_half(q) * sin
@@ -75,23 +99,23 @@ class Attention(nn.Module):
         assert args.num_key_value_heads is not None
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        head_dim = args.head_dim
+        self.head_dim = head_dim
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=args.attention_bias)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.attention_bias)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=args.attention_bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=args.attention_bias)
 
-        # Text-only path: rope_scaling type "mrope" resolves to plain nn.RoPE
-        # (equal t/h/w axes degenerate to exactly 1D rope).
-        self.rope = initialize_rope(
-            head_dim,
-            base=args.rope_theta,
-            traditional=args.rope_traditional,
-            scaling_config=args.rope_scaling,
-            max_position_embeddings=args.max_position_embeddings,
-        )
+        self.use_qk_norm = args.use_qk_norm
+        if self.use_qk_norm:
+            self.query_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
+            self.key_layernorm = nn.RMSNorm(head_dim, args.rms_norm_eps)
+
+        # Text-only path: NTK-alpha rope, identical to hunyuan_v1_dense (equal
+        # p/w/h/t axes make xdrope degenerate to exactly this).
+        self.rope = DynamicNTKAlphaRoPE(head_dim, base=_scaled_rope_base(args))
 
     def __call__(
         self,
@@ -104,22 +128,31 @@ class Attention(nn.Module):
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            queries, keys = _apply_mrope(queries, keys, cos, sin)
-            if cache is not None:
-                keys, values = cache.update_and_fetch(keys, values)
+            queries, keys = _apply_xdrope(queries, keys, cos, sin)
         elif cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
+
+        # QK norm comes AFTER rope in hunyuan (both dense and VL).
+        if self.use_qk_norm:
+            queries = self.query_layernorm(queries)
+            keys = self.key_layernorm(keys)
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -129,11 +162,12 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, args: TextModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        dim, hidden_dim = args.hidden_size, args.intermediate_size
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=args.mlp_bias)
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
@@ -143,7 +177,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
@@ -162,7 +196,7 @@ class TransformerBlock(nn.Module):
         return h + r
 
 
-class Qwen2VLModel(nn.Module):
+class HunyuanVLModel(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.args = args
@@ -172,29 +206,33 @@ class Qwen2VLModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        # Multimodal RoPE side state (mlx-unified), set by the vision path before
-        # generation and cleared afterwards. Underscore attrs so MLX's module walker
-        # never registers them as parameters.
-        head_dim = args.hidden_size // args.num_attention_heads
+        # XD-RoPE side state (mlx-unified), set by the vision path before generation
+        # and cleared afterwards. Underscore attrs so MLX's module walker never
+        # registers them as parameters.
+        head_dim = args.head_dim
         half_dim = head_dim // 2
-        self._inv_freq = args.rope_theta ** (
+        base = _scaled_rope_base(args)
+        self._inv_freq = base ** (
             -mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim
         )
-        # Frequency-index -> position-axis map: chunks of the half in mrope_section
-        # order (t, h, w); indices past the sections stay on axis 0 (temporal).
-        selector = [0] * half_dim
-        sections = (args.rope_scaling or {}).get("mrope_section") or [half_dim, 0, 0]
-        offset = sections[0]
-        for axis, length in enumerate(sections[1:], start=1):
-            for idx in range(offset, min(offset + length, half_dim)):
-                selector[idx] = axis
-            offset += length
+        sections = (args.rope_scaling or {}).get("xdrope_section") or [half_dim]
+        if sum(sections) != half_dim:
+            raise ValueError(
+                f"xdrope_section {sections} must sum to head_dim/2 ({half_dim})"
+            )
+        # Frequency-index -> position-axis map: chunks of the half in xdrope_section
+        # order, axes as the processor stacks them: (p, w, h, t).
+        selector = []
+        for axis, length in enumerate(sections):
+            selector.extend([axis] * length)
         self._axis_selector = mx.array(selector, dtype=mx.int32)
+        self._num_axes = len(sections)
         self._mm_position_ids = None
         self._mm_rope_deltas = None
 
     def set_mrope_state(self, position_ids: mx.array, rope_deltas: mx.array) -> None:
-        """Install 3D multimodal positions (3, B, L) + rope delta for a vision prompt."""
+        """Install 4-axis xdrope positions (4, B, L), processor order (p, w, h, t),
+        plus the rope delta (always 0 for hunyuan) for a vision prompt."""
         self._mm_position_ids = position_ids
         self._mm_rope_deltas = rope_deltas
 
@@ -209,13 +247,13 @@ class Qwen2VLModel(nn.Module):
         1D-RoPE path. During chunked prefill the stored prompt positions are
         sliced by cache offset (stitching a sequential tail if a chunk crosses
         the end); once the prompt is exhausted, decode positions are
-        cache_offset + rope_delta broadcast to all three mrope axes.
+        cache_offset + rope_delta broadcast to all xdrope axes.
         """
         if self._mm_position_ids is None and self._mm_rope_deltas is None:
             return None
         if self._mm_position_ids is not None and self._mm_rope_deltas is None:
             raise ValueError(
-                "MRoPE state is inconsistent: position_ids set without rope_deltas."
+                "XD-RoPE state is inconsistent: position_ids set without rope_deltas."
             )
 
         cache_offset = 0
@@ -276,7 +314,9 @@ class Qwen2VLModel(nn.Module):
                 delta = mx.broadcast_to(delta, (batch_size, delta.shape[1]))
 
         position_ids = mx.add(position_ids, delta)[None, ...]
-        return mx.broadcast_to(position_ids, (3, batch_size, seq_length))
+        return mx.broadcast_to(
+            position_ids, (self._num_axes, batch_size, seq_length)
+        )
 
     def __call__(
         self,
@@ -296,7 +336,7 @@ class Qwen2VLModel(nn.Module):
         position_ids = self._compute_position_ids(inputs, cache)
         position_embeddings = None
         if position_ids is not None:
-            position_embeddings = _mrope_cos_sin(
+            position_embeddings = _xdrope_cos_sin(
                 position_ids, self._inv_freq, self._axis_selector
             )
 
@@ -313,7 +353,7 @@ class TextModel(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen2VLModel(args)
+        self.model = HunyuanVLModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -340,9 +380,13 @@ class ModelArgs(BaseModelArgs):
 
     @classmethod
     def from_dict(cls, params):
-        if "text_config" not in params:
-            return cls(model_type=params["model_type"], text_config=params)
-        return super().from_dict(params)
+        # Hunyuan-VL configs keep text fields at the top level next to
+        # vision_config; fold them into text_config (nested values win).
+        text_config = dict(params.get("text_config") or {})
+        for k, v in params.items():
+            if k not in ("text_config", "vision_config") and k not in text_config:
+                text_config[k] = v
+        return cls(model_type=params["model_type"], text_config=text_config)
 
 
 class Model(nn.Module):
@@ -369,14 +413,13 @@ class Model(nn.Module):
         return self.language_model.model
 
     def sanitize(self, weights):
-        # Accepts mlx-vlm conversions ("language_model.model.*" + "vision_tower.*"),
-        # raw HF checkpoints ("model.layers.*" + "visual.*"), and post-refactor HF
-        # nesting ("model.language_model.*" + "model.visual.*").
+        # Accepts mlx-vlm conversions ("language_model.model.*" + "vision_tower.*")
+        # and raw Tencent checkpoints ("model.layers.*" + "vit.*").
         tied = self.language_model.args.tie_word_embeddings
         sanitized = {}
         for key, value in weights.items():
             if key.startswith(
-                ("visual.", "vision_tower.", "model.visual.", "model.vision_tower.")
+                ("vit.", "vision_tower.", "model.vit.", "model.vision_tower.")
             ):
                 continue
             if key.startswith("model.language_model."):

@@ -1,14 +1,14 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
+#
+# Qwen3-VL-MoE text model: qwen3_vl with sparse-MoE MLPs (selected via the
+# shared TextModelArgs MoE fields) plus checkpoint-specific expert-weight
+# sanitizing. Multimodal side state (interleaved mrope + deepstack) is
+# inherited from qwen3_vl.
 
 from dataclasses import dataclass
-from typing import Optional
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
-
-from . import qwen3_moe
 from .base import BaseModelArgs
+from .qwen3_vl import Model as Qwen3VLModel
 
 
 @dataclass
@@ -16,40 +16,22 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
 
+    @classmethod
+    def from_dict(cls, params):
+        if "text_config" not in params:
+            return cls(model_type=params["model_type"], text_config=params)
+        return super().from_dict(params)
 
-class Model(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.language_model = qwen3_moe.Model(
-            qwen3_moe.ModelArgs.from_dict(args.text_config)
-        )
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-        input_embeddings: Optional[mx.array] = None,
-    ):
-        return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
-        )
+class Model(Qwen3VLModel):
 
     def sanitize(self, weights):
-        weights = tree_unflatten(list(weights.items()))
-        weights.pop("visual", None)
-        weights = dict(
-            tree_flatten(
-                {
-                    "language_model": {
-                        "model": weights["language_model"]["model"],
-                        "lm_head": weights["language_model"]["lm_head"],
-                    }
-                }
-            )
-        )
+        weights = super().sanitize(weights)
 
+        # Original HF checkpoints fuse each layer's experts into a single
+        # (num_experts, hidden, 2*moe_intermediate) gate_up tensor; split and
+        # transpose into SwitchGLU's (num_experts, moe_intermediate, hidden).
+        # mlx-vlm conversions already store switch_mlp.* and pass through.
         for l in range(self.language_model.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
@@ -67,11 +49,3 @@ class Model(nn.Module):
                 ).swapaxes(-2, -1)
 
         return weights
-
-    @property
-    def quant_predicate(self):
-        return self.language_model.quant_predicate
-
-    @property
-    def layers(self):
-        return self.language_model.model.layers

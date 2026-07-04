@@ -142,8 +142,12 @@ class LanguageModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        h = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -170,8 +174,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        h = self.model(inputs, cache)
+        h = self.model(inputs, cache, input_embeddings)
         if self.tie_word_embeddings:
             return h @ self.model.embed_tokens.weight.T
         else:

@@ -45,6 +45,28 @@ class ModelArgs(BaseModelArgs):
     scoring_func: str = "sigmoid"
     topk_method: str = "noaux_tc"
 
+    @classmethod
+    def from_dict(cls, params):
+        # A GLM-4.5V (glm4v_moe) checkpoint nests the language model under
+        # text_config, with a few fields (e.g. tie_word_embeddings) only at the
+        # top level — flatten it; the MoE body matches glm4_moe field-for-field.
+        if "text_config" in params:
+            params = {**params, **params["text_config"]}
+        return super().from_dict(params)
+
+
+def _rotate_half(x):
+    mid = x.shape[-1] // 2
+    return mx.concatenate([-x[..., mid:], x[..., :mid]], axis=-1)
+
+
+def _apply_mrope(x, cos, sin):
+    """Rotate the first cos.shape[-1] dims with half-split pairing (GLM-4.5V style)."""
+    rotary_dim = cos.shape[-1]
+    x_rot = x[..., :rotary_dim]
+    x_rot = x_rot * cos + _rotate_half(x_rot) * sin
+    return mx.concatenate([x_rot, x[..., rotary_dim:]], axis=-1)
+
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -78,6 +100,7 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_embeddings: Optional[tuple] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -93,7 +116,14 @@ class Attention(nn.Module):
         queries = queries.transpose(0, 2, 1, 3)
         keys = keys.transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        if cache is not None:
+        if position_embeddings is not None:
+            # Vision: 3D multimodal RoPE over the same attention weights.
+            cos, sin = position_embeddings
+            queries = _apply_mrope(queries, cos, sin)
+            keys = _apply_mrope(keys, cos, sin)
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
+        elif cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
@@ -247,8 +277,9 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_embeddings: Optional[tuple] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
@@ -263,13 +294,133 @@ class LanguageModel(PipelineMixin, nn.Module):
             DecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Multimodal RoPE side state (mlx-unified), set by the vision path before
+        # generation and cleared afterwards — same contract as qwen3_5.py. Underscore
+        # attrs so MLX's module walker never registers them as parameters.
+        rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+        self._inv_freq = 1.0 / (
+            config.rope_theta
+            ** (mx.arange(0, rotary_dim, 2, dtype=mx.float32) / rotary_dim)
+        )
+        # Which mrope axis (t/h/w) feeds each frequency: chunked by mrope_section
+        # (GLM-4.5V: [8, 12, 12]). None for text-only GLM-4.5 checkpoints.
+        mrope_section = (config.rope_scaling or {}).get("mrope_section")
+        self._axis_selector = (
+            mx.array([axis for axis, n in enumerate(mrope_section) for _ in range(n)])
+            if mrope_section
+            else None
+        )
+        self._mm_position_ids = None
+        self._mm_rope_deltas = None
+
+    def set_mrope_state(self, position_ids: mx.array, rope_deltas: mx.array) -> None:
+        """Install 3D multimodal positions (3, B, L) + rope delta for a vision prompt."""
+        if self._axis_selector is None:
+            raise ValueError(
+                "this checkpoint's rope_scaling has no mrope_section — it cannot "
+                "consume multimodal positions"
+            )
+        self._mm_position_ids = position_ids
+        self._mm_rope_deltas = rope_deltas
+
+    def reset_mrope_state(self) -> None:
+        self._mm_position_ids = None
+        self._mm_rope_deltas = None
+
+    def _compute_position_ids(self, inputs: mx.array, cache) -> Optional[mx.array]:
+        """Positions for the current forward pass from stored multimodal state.
+
+        None (the common text-only case) routes every layer to the original
+        1D-RoPE path. During chunked prefill the stored prompt positions are
+        sliced by cache offset (stitching a sequential tail if a chunk crosses
+        the end); once the prompt is exhausted, decode positions are
+        cache_offset + rope_delta broadcast to all three mrope axes.
+        """
+        if self._mm_position_ids is None and self._mm_rope_deltas is None:
+            return None
+        if self._mm_position_ids is not None and self._mm_rope_deltas is None:
+            raise ValueError(
+                "MRoPE state is inconsistent: position_ids set without rope_deltas."
+            )
+
+        cache_offset = 0
+        cache_offset_scalar = 0
+        if cache is not None and cache[0] is not None:
+            offset = cache[0].offset
+            if isinstance(offset, int):
+                cache_offset = offset
+                cache_offset_scalar = offset
+            elif isinstance(offset, mx.array) and offset.ndim == 0:
+                cache_offset = offset.item()
+                cache_offset_scalar = cache_offset
+            elif isinstance(offset, mx.array):
+                cache_offset = offset
+                cache_offset_scalar = offset[0].item()
+
+        batch_size, seq_length = inputs.shape
+
+        if self._mm_position_ids is not None:
+            stored_seq_length = self._mm_position_ids.shape[2]
+            if cache_offset_scalar < stored_seq_length:
+                stored_end = min(cache_offset_scalar + seq_length, stored_seq_length)
+                stored_positions = self._mm_position_ids[
+                    :, :, cache_offset_scalar:stored_end
+                ]
+                if stored_end - cache_offset_scalar == seq_length:
+                    return stored_positions
+                tail_positions = self._sequential_position_ids(
+                    batch_size=batch_size,
+                    seq_length=seq_length - (stored_end - cache_offset_scalar),
+                    start_offset=stored_seq_length,
+                )
+                return mx.concatenate([stored_positions, tail_positions], axis=2)
+
+        return self._sequential_position_ids(
+            batch_size=batch_size, seq_length=seq_length, start_offset=cache_offset
+        )
+
+    def _sequential_position_ids(
+        self, *, batch_size: int, seq_length: int, start_offset
+    ) -> mx.array:
+        delta = mx.array(start_offset)
+        if self._mm_rope_deltas is not None:
+            delta = delta + self._mm_rope_deltas
+
+        position_ids = mx.arange(seq_length).reshape(1, -1)
+        position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
+
+        if delta.ndim == 0:
+            delta = mx.broadcast_to(delta.reshape(1, 1), (batch_size, 1))
+        elif delta.ndim == 1:
+            delta = delta[:batch_size].reshape(-1, 1)
+            if delta.shape[0] == 1 and batch_size > 1:
+                delta = mx.broadcast_to(delta, (batch_size, 1))
+        else:
+            delta = delta[:batch_size]
+            if delta.shape[0] == 1 and batch_size > 1:
+                delta = mx.broadcast_to(delta, (batch_size, delta.shape[1]))
+
+        position_ids = mx.add(position_ids, delta)[None, ...]
+        return mx.broadcast_to(position_ids, (3, batch_size, seq_length))
+
+    def _position_embeddings(self, position_ids: mx.array, dtype) -> tuple:
+        """cos/sin (B, 1, L, rotary_dim) in half-split layout from (3, B, L) positions."""
+        positions = mx.take(position_ids, self._axis_selector, axis=0)
+        angle = positions.transpose(1, 2, 0).astype(mx.float32) * self._inv_freq
+        cos = mx.tile(mx.cos(angle)[:, None], (1, 1, 1, 2))
+        sin = mx.tile(mx.sin(angle)[:, None], (1, 1, 1, 2))
+        return cos.astype(dtype), sin.astype(dtype)
 
     def __call__(
         self,
         x: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        h = self.embed_tokens(x)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(x)
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
@@ -278,12 +429,18 @@ class LanguageModel(PipelineMixin, nn.Module):
             cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(h, cache[0])
 
+        # None for text-only requests — layers take the original 1D-RoPE path.
+        position_ids = self._compute_position_ids(x, cache)
+        position_embeddings = None
+        if position_ids is not None:
+            position_embeddings = self._position_embeddings(position_ids, h.dtype)
+
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for l, c in zip(self.pipeline_layers, cache):
-            h = l(h, mask, cache=c)
+            h = l(h, mask, cache=c, position_embeddings=position_embeddings)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -310,11 +467,27 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings=input_embeddings)
         return self.lm_head(out)
 
     def sanitize(self, weights):
+        # A GLM-4.5V (glm4v_moe) checkpoint carries a vision tower and prefixes the
+        # language model — strip/remap down to this text-only structure first.
+        def to_text_key(k):
+            if k.startswith("model.language_model."):
+                return "model." + k[len("model.language_model.") :]
+            if k.startswith("language_model."):
+                return k[len("language_model.") :]
+            return k
+
+        weights = {
+            to_text_key(k): v
+            for k, v in weights.items()
+            if not k.startswith(("model.visual", "visual", "vision_tower"))
+        }
+
         mpt_layer = self.args.num_hidden_layers
 
         # Stack experts

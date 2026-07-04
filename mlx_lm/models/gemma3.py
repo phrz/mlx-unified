@@ -59,5 +59,11 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.layers
 
+    @property
+    def model(self):
+        # Uniform access to the inner text model (multimodal side state lives
+        # there) — the same shape as gemma4.py's Model.model property.
+        return self.language_model.model
+
     def make_cache(self):
         return self.language_model.make_cache()

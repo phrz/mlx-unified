@@ -67,6 +67,15 @@ class ModelArgs(BaseModelArgs):
     def use_moe(self) -> bool:
         return bool(self.num_local_experts)
 
+    @classmethod
+    def from_dict(cls, params):
+        # granite4_vision checkpoints nest the text body under text_config — adopt it
+        # wholesale (the top-level model_type is kept, matching the qwen3_5/gemma4
+        # pattern for multimodal checkpoints loaded as text-only models).
+        if "text_config" in params:
+            params = {**params["text_config"], "model_type": params["model_type"]}
+        return super().from_dict(params)
+
 
 class GraniteMoeHybridRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -438,12 +447,46 @@ class GraniteMoeHybridModel(nn.Module):
             args.layer_types.index("mamba") if "mamba" in args.layer_types else None
         )
 
+        # Multimodal side state (mlx-unified): deepstack mid-layer visual injection
+        # (granite4_vision), set by the vision path before generation and cleared
+        # afterwards. Underscore attrs so MLX's module walker never registers them
+        # as parameters.
+        self._visual_pos_masks = None  # (1, S) bool over the full multimodal prompt
+        self._deepstack_visual_embeds = None  # (n_sets, S, hidden), zero at text
+        self._deepstack_target_layers = None  # decoder layer index per feature set
+        self._visual_cursor = 0  # prompt positions consumed by prefill so far
+
+    def set_visual_state(
+        self,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        deepstack_target_layers=None,
+    ) -> None:
+        """Install deepstack state for a multimodal prompt: per-position image masks
+        plus one full-sequence feature add per target decoder layer. Injection is
+        prefill-only — it rides on forwards that carry input_embeddings — and the
+        cursor keeps chunked prefill aligned with the stored full-prompt arrays."""
+        self._visual_pos_masks = visual_pos_masks
+        self._deepstack_visual_embeds = deepstack_visual_embeds
+        self._deepstack_target_layers = deepstack_target_layers
+        self._visual_cursor = 0
+
+    def reset_visual_state(self) -> None:
+        self._visual_pos_masks = None
+        self._deepstack_visual_embeds = None
+        self._deepstack_target_layers = None
+        self._visual_cursor = 0
+
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        hidden_states = self.embed_tokens(inputs) * self.embedding_multiplier
+        if input_embeddings is not None:
+            hidden_states = input_embeddings * self.embedding_multiplier
+        else:
+            hidden_states = self.embed_tokens(inputs) * self.embedding_multiplier
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -457,7 +500,28 @@ class GraniteMoeHybridModel(nn.Module):
         if self.ssm_idx is not None:
             mamba_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Slice this forward's window of the deepstack state; decode steps pass
+        # token ids (no input_embeddings) and are untouched.
+        visual_mask = deepstack_embeds = None
+        if input_embeddings is not None and self._deepstack_visual_embeds is not None:
+            start = self._visual_cursor
+            stop = start + hidden_states.shape[1]
+            visual_mask = self._visual_pos_masks[:, start:stop]
+            deepstack_embeds = self._deepstack_visual_embeds[:, start:stop]
+            self._visual_cursor = stop
+
+        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+            if deepstack_embeds is not None:
+                # Feature adds land on the residual stream BEFORE the target layer
+                # runs — layer type (mamba or attention) is irrelevant, matching
+                # mlx-vlm's granite4_vision wrapper.
+                for feat_idx, target in enumerate(self._deepstack_target_layers):
+                    if layer_idx == target:
+                        hidden_states = mx.where(
+                            visual_mask[..., None],
+                            hidden_states + deepstack_embeds[feat_idx],
+                            hidden_states,
+                        )
             mask = attn_mask if layer.layer_type == "attention" else mamba_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
@@ -478,8 +542,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache=cache)
+        out = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
 
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
@@ -502,6 +567,25 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
+        # granite4_vision checkpoints wrap this text body in a vision model — strip
+        # the tower/projectors and remap the language model onto our flat layout
+        # (mlx-vlm conversions use language_model.model.*, raw HF model.language_model.*).
+        if any(k.startswith(("language_model.", "model.language_model.")) for k in weights):
+            remapped = {}
+            for k, v in weights.items():
+                if k.startswith("language_model."):
+                    k = k[len("language_model.") :]  # → model.* / lm_head.*
+                elif k.startswith("model.language_model."):
+                    k = "model." + k[len("model.language_model.") :]
+                elif not k.startswith("lm_head."):
+                    continue  # vision_tower / *_projectors / image_newline
+                remapped[k] = v
+            weights = remapped
+            if self.args.tie_word_embeddings:
+                # conversions materialize the tied head; ours reuses embed_tokens
+                for k in ("lm_head.weight", "lm_head.scales", "lm_head.biases"):
+                    weights.pop(k, None)
+
         # Handle conv1d weights
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -515,18 +599,20 @@ class Model(nn.Module):
             for l in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{l}.block_sparse_moe"
 
-                input_weight = weights.pop(f"{prefix}.input_linear.weight")
-                _, expert_hidden, _ = input_weight.shape
+                # quantized (mlx-vlm) conversions carry scales/biases alongside the
+                # packed weight; all split along the fused output axis identically
+                for sfx in ("weight", "scales", "biases"):
+                    if f"{prefix}.input_linear.{sfx}" not in weights:
+                        continue
+                    gate_proj, up_proj = mx.split(
+                        weights.pop(f"{prefix}.input_linear.{sfx}"), 2, axis=1
+                    )
+                    weights[f"{prefix}.switch_mlp.gate_proj.{sfx}"] = gate_proj
+                    weights[f"{prefix}.switch_mlp.up_proj.{sfx}"] = up_proj
 
-                # Split into gate and up projections (each half of expert_hidden)
-                gate_proj = input_weight[:, : expert_hidden // 2, :]
-                up_proj = input_weight[:, expert_hidden // 2 :, :]
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_proj
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_proj
-
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.output_linear.weight"
-                )
+                    weights[f"{prefix}.switch_mlp.down_proj.{sfx}"] = weights.pop(
+                        f"{prefix}.output_linear.{sfx}"
+                    )
 
         # Handle dense MLP weight transformation (for dense models)
         elif (
@@ -537,15 +623,19 @@ class Model(nn.Module):
                 prefix = f"model.layers.{l}.shared_mlp"
 
                 # Transform shared_mlp weights to standard mlp weights
-                input_weight = weights.pop(f"{prefix}.input_linear.weight")
-                # Split into gate and up projections (each half)
-                gate_proj, up_proj = mx.split(input_weight, 2, axis=0)
-                weights[f"model.layers.{l}.mlp.gate_proj.weight"] = gate_proj
-                weights[f"model.layers.{l}.mlp.up_proj.weight"] = up_proj
+                for sfx in ("weight", "scales", "biases"):
+                    if f"{prefix}.input_linear.{sfx}" not in weights:
+                        continue
+                    # Split into gate and up projections (each half)
+                    gate_proj, up_proj = mx.split(
+                        weights.pop(f"{prefix}.input_linear.{sfx}"), 2, axis=0
+                    )
+                    weights[f"model.layers.{l}.mlp.gate_proj.{sfx}"] = gate_proj
+                    weights[f"model.layers.{l}.mlp.up_proj.{sfx}"] = up_proj
 
-                weights[f"model.layers.{l}.mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.output_linear.weight"
-                )
+                    weights[f"model.layers.{l}.mlp.down_proj.{sfx}"] = weights.pop(
+                        f"{prefix}.output_linear.{sfx}"
+                    )
 
         return weights
 

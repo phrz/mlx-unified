@@ -1,96 +1,95 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
 #
-# Qwen2-VL / Qwen2.5-VL text model with 3D multimodal RoPE side state (mlx-unified).
-# The rope math is ported from Blaizzy/mlx-vlm's models/qwen2_vl/language.py and
-# models/rope_utils.py (MIT © Blaizzy/mlx-vlm contributors): Qwen2-VL's
-# sectioned-half-split mrope rotates the FULL head_dim, with mrope_section chunks of
-# the frequency half assigned to the (t, h, w) position axes — unlike qwen3_5's
-# partial-rotary interleaved layout. Selecting the axis per frequency before cos/sin
-# (mlx-vlm's "chunked" style) is numerically identical to sectioning precomputed
-# cos/sin at Q/K application ("sectioned_half_split") and needs no per-layer state.
+# GLM-family multimodal text models: glm4v_text (GLM-4.1V dense) and glm_ocr_text
+# (GLM-OCR) — the GLM4 dense body with GLM-style 3D multimodal RoPE applied over
+# PARTIAL rotary dims (glm4v: factor 0.5, mrope_section [8, 12, 12]; glm_ocr:
+# factor 1.0, mrope_section [16, 24, 24]). The two bodies coincide field-for-field,
+# so one file serves both, parameterized by config. Language architecture ported
+# from Blaizzy/mlx-vlm's glm4v and glm_ocr models (MIT © Blaizzy/mlx-vlm
+# contributors); the mrope side-state pattern follows this fork's qwen3_5.py.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
 
 
 @dataclass
 class TextModelArgs(BaseModelArgs):
-    model_type: str = "qwen2_vl"
-    hidden_size: int = 1536
-    num_hidden_layers: int = 28
-    intermediate_size: int = 8960
-    num_attention_heads: int = 12
-    rms_norm_eps: float = 1e-6
-    vocab_size: int = 151936
-    num_key_value_heads: Optional[int] = None
-    max_position_embeddings: int = 32768
-    rope_theta: float = 1000000.0
-    rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str, list]]] = None
+    model_type: str = "glm4v_text"
+    hidden_size: int = 4096
+    num_hidden_layers: int = 40
+    intermediate_size: int = 13696
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 2
+    head_dim: Optional[int] = None
+    rms_norm_eps: float = 1e-5
+    vocab_size: int = 151552
+    attention_bias: bool = True
+    max_position_embeddings: int = 65536
     tie_word_embeddings: bool = False
+    # glm4v keeps rope fields flat (rope_scaling carries only the mrope_section);
+    # glm_ocr nests everything under rope_parameters. Normalized in __post_init__.
+    partial_rotary_factor: float = 0.5
+    rope_theta: float = 10000.0
+    rope_scaling: Optional[Dict] = None
+    rope_parameters: Optional[Dict] = None
+    mrope_section: Optional[List[int]] = None
 
     def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+        params = self.rope_parameters or self.rope_scaling or {}
+        self.partial_rotary_factor = params.get(
+            "partial_rotary_factor", self.partial_rotary_factor
+        )
+        self.rope_theta = params.get("rope_theta", self.rope_theta)
+        self.mrope_section = params.get("mrope_section", [8, 12, 12])
 
 
-def _rotate_half(x):
-    mid = x.shape[-1] // 2
-    return mx.concatenate([-x[..., mid:], x[..., :mid]], axis=-1)
+def _rotate_half_even_odd(x):
+    return mx.flatten(mx.stack([-x[..., 1::2], x[..., 0::2]], axis=-1), -2, -1)
 
 
-def _mrope_cos_sin(position_ids, inv_freq, axis_selector):
-    """(3, B, L) positions -> half-split cos/sin of shape (B, 1, L, head_dim).
-
-    Each frequency index reads the position axis its mrope_section chunk names;
-    duplicating the half then matches _rotate_half's (d, d + dim/2) pairing.
-    """
-    positions = mx.take(position_ids, axis_selector, axis=0).transpose(1, 2, 0)
-    angles = positions.astype(mx.float32) * inv_freq
-    angles = mx.concatenate([angles, angles], axis=-1)
-    return mx.cos(angles)[:, None], mx.sin(angles)[:, None]
-
-
-def _apply_mrope(queries, keys, cos, sin):
-    q = queries.astype(mx.float32)
-    k = keys.astype(mx.float32)
-    q = q * cos + _rotate_half(q) * sin
-    k = k * cos + _rotate_half(k) * sin
-    return q.astype(queries.dtype), k.astype(keys.dtype)
+def _apply_mrope(x, cos, sin):
+    """Rotate the first cos.shape[-1] dims with even/odd (traditional) pairing."""
+    rotary_dim = cos.shape[-1]
+    x_rot = x[..., :rotary_dim]
+    x_rot = x_rot * cos + _rotate_half_even_odd(x_rot) * sin
+    if rotary_dim == x.shape[-1]:
+        return x_rot
+    return mx.concatenate([x_rot, x[..., rotary_dim:]], axis=-1)
 
 
 class Attention(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
-
         dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        assert args.num_key_value_heads is not None
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        self.n_heads = args.num_attention_heads
+        self.n_kv_heads = args.num_key_value_heads
+        self.head_dim = args.head_dim
+        self.scale = self.head_dim**-0.5
 
-        head_dim = args.hidden_size // n_heads
-        self.scale = head_dim**-0.5
+        self.q_proj = nn.Linear(
+            dim, self.n_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            dim, self.n_kv_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            dim, self.n_kv_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
-
-        # Text-only path: rope_scaling type "mrope" resolves to plain nn.RoPE
-        # (equal t/h/w axes degenerate to exactly 1D rope).
-        self.rope = initialize_rope(
-            head_dim,
+        # Text-only path: GLM rotates even/odd pairs, i.e. traditional RoPE over the
+        # partial dims — 3D mrope with equal t/h/w axes degenerates to exactly this.
+        self.rope = nn.RoPE(
+            dims=int(self.head_dim * args.partial_rotary_factor),
+            traditional=True,
             base=args.rope_theta,
-            traditional=args.rope_traditional,
-            scaling_config=args.rope_scaling,
-            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -109,8 +108,10 @@ class Attention(nn.Module):
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if position_embeddings is not None:
+            # Vision: 3D multimodal RoPE over the same attention weights.
             cos, sin = position_embeddings
-            queries, keys = _apply_mrope(queries, keys, cos, sin)
+            queries = _apply_mrope(queries, cos, sin)
+            keys = _apply_mrope(keys, cos, sin)
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
         elif cache is not None:
@@ -129,25 +130,32 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, args: TextModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.gate_up_proj = nn.Linear(
+            args.hidden_size, 2 * args.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        x = self.gate_up_proj(x)
+        gate, up_states = mx.split(x, 2, axis=-1)
+        return self.down_proj(nn.silu(gate) * up_states)
 
 
-class TransformerBlock(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
+        self.post_self_attn_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_mlp_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
@@ -156,40 +164,35 @@ class TransformerBlock(nn.Module):
         cache: Optional[Any] = None,
         position_embeddings: Optional[tuple] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        x = x + self.post_self_attn_layernorm(
+            self.self_attn(self.input_layernorm(x), mask, cache, position_embeddings)
+        )
+        residual = x
+        x = (
+            self.post_mlp_layernorm(self.mlp(self.post_attention_layernorm(x)))
+            + residual
+        )
+        return x
 
 
-class Qwen2VLModel(nn.Module):
+class Glm4vTextModel(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
-        self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
-        ]
+        self.layers = [DecoderLayer(args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-
         # Multimodal RoPE side state (mlx-unified), set by the vision path before
-        # generation and cleared afterwards. Underscore attrs so MLX's module walker
-        # never registers them as parameters.
-        head_dim = args.hidden_size // args.num_attention_heads
-        half_dim = head_dim // 2
-        self._inv_freq = args.rope_theta ** (
-            -mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim
+        # generation and cleared afterwards — same contract as qwen3_5.py. Underscore
+        # attrs so MLX's module walker never registers them as parameters.
+        rotary_dim = int(args.head_dim * args.partial_rotary_factor)
+        self._inv_freq = 1.0 / (
+            args.rope_theta
+            ** (mx.arange(0, rotary_dim, 2, dtype=mx.float32) / rotary_dim)
         )
-        # Frequency-index -> position-axis map: chunks of the half in mrope_section
-        # order (t, h, w); indices past the sections stay on axis 0 (temporal).
-        selector = [0] * half_dim
-        sections = (args.rope_scaling or {}).get("mrope_section") or [half_dim, 0, 0]
-        offset = sections[0]
-        for axis, length in enumerate(sections[1:], start=1):
-            for idx in range(offset, min(offset + length, half_dim)):
-                selector[idx] = axis
-            offset += length
-        self._axis_selector = mx.array(selector, dtype=mx.int32)
+        # Which mrope axis (t/h/w) feeds each frequency: chunked by mrope_section.
+        self._axis_selector = mx.array(
+            [axis for axis, n in enumerate(args.mrope_section) for _ in range(n)]
+        )
         self._mm_position_ids = None
         self._mm_rope_deltas = None
 
@@ -278,12 +281,20 @@ class Qwen2VLModel(nn.Module):
         position_ids = mx.add(position_ids, delta)[None, ...]
         return mx.broadcast_to(position_ids, (3, batch_size, seq_length))
 
+    def _position_embeddings(self, position_ids: mx.array, dtype) -> tuple:
+        """cos/sin (B, 1, L, rotary_dim) in even/odd layout from (3, B, L) positions."""
+        positions = mx.take(position_ids, self._axis_selector, axis=0)
+        angle = positions.transpose(1, 2, 0).astype(mx.float32) * self._inv_freq
+        cos = mx.repeat(mx.cos(angle)[:, None], 2, axis=-1)
+        sin = mx.repeat(mx.sin(angle)[:, None], 2, axis=-1)
+        return cos.astype(dtype), sin.astype(dtype)
+
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
+        cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
-    ):
+    ) -> mx.array:
         if input_embeddings is not None:
             h = input_embeddings
         else:
@@ -296,14 +307,12 @@ class Qwen2VLModel(nn.Module):
         position_ids = self._compute_position_ids(inputs, cache)
         position_embeddings = None
         if position_ids is not None:
-            position_embeddings = _mrope_cos_sin(
-                position_ids, self._inv_freq, self._axis_selector
-            )
+            position_embeddings = self._position_embeddings(position_ids, h.dtype)
 
         mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c, position_embeddings)
+            h = layer(h, mask, cache=c, position_embeddings=position_embeddings)
 
         return self.norm(h)
 
@@ -313,16 +322,16 @@ class TextModel(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen2VLModel(args)
+        self.model = Glm4vTextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
-        cache=None,
+        cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
-    ):
+    ) -> mx.array:
         out = self.model(inputs, cache, input_embeddings=input_embeddings)
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(out)
@@ -331,6 +340,16 @@ class TextModel(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def sanitize(self, weights):
+        # GLM-OCR ships a multi-token-prediction block as layer[num_hidden_layers].
+        mtp_prefix = f"model.layers.{self.args.num_hidden_layers}."
+        weights = {k: v for k, v in weights.items() if mtp_prefix not in k}
+        if self.args.tie_word_embeddings:
+            weights = {
+                k: v for k, v in weights.items() if not k.endswith("lm_head.weight")
+            }
+        return weights
 
 
 @dataclass
@@ -369,26 +388,16 @@ class Model(nn.Module):
         return self.language_model.model
 
     def sanitize(self, weights):
-        # Accepts mlx-vlm conversions ("language_model.model.*" + "vision_tower.*"),
-        # raw HF checkpoints ("model.layers.*" + "visual.*"), and post-refactor HF
-        # nesting ("model.language_model.*" + "model.visual.*").
-        tied = self.language_model.args.tie_word_embeddings
         sanitized = {}
         for key, value in weights.items():
-            if key.startswith(
-                ("visual.", "vision_tower.", "model.visual.", "model.vision_tower.")
-            ):
+            if key.startswith(("vision_tower", "visual", "model.visual")):
                 continue
-            if key.startswith("model.language_model."):
-                key = key.replace("model.language_model.", "language_model.model.", 1)
+            if key.startswith("model.language_model"):
+                key = key.replace("model.language_model", "language_model.model")
             elif not key.startswith("language_model."):
                 key = "language_model." + key
-            if "self_attn.rotary_emb.inv_freq" in key:
-                continue
-            if tied and key.startswith("language_model.lm_head."):
-                continue
             sanitized[key] = value
-        return sanitized
+        return self.language_model.sanitize(sanitized)
 
     @property
     def layers(self):

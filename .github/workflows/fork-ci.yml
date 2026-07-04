@@ -1,0 +1,75 @@
+# CI for the phrz/mlx-unified fork only. Upstream's pull_request.yml is gated to
+# ml-explore/mlx-lm and its self-hosted runners; this workflow is its counterpart on
+# GitHub-hosted Apple-silicon runners (macos-15 = arm64, required by mlx).
+#
+# Network policy: the upstream release's test_data.zip is a pre-populated HF cache
+# (hub models + the billsum dataset) covering every repo the tests reference, so the
+# suite runs with HF_HUB_OFFLINE=1 — no live Hugging Face traffic to flake on. The
+# only network-dependent test, tests/test_unified_coverage.py, shallow-clones
+# lmstudio-ai/mlx-engine itself and self-skips if the clone fails.
+
+name: Fork CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  mac_test:
+    if: github.repository == 'phrz/mlx-unified'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install package with test + vision extras
+        # The vision extra is mlx-vlm + Pillow with the fork's known-good
+        # transformers pin (>=5.7.0,<5.13.0 — 5.13 broke AutoTokenizer.register).
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[test,vision]"
+
+      - name: Fetch test data (pre-populated HF cache)
+        # Same fixture the upstream workflow curls: an HF_HOME tree with the
+        # mlx-community models and the billsum dataset cache the tests load.
+        run: |
+          curl -o test_data.zip -L https://github.com/ml-explore/mlx-lm/releases/download/test_data/test_data.zip
+          unzip -q test_data.zip
+
+      - name: Run test suite (upstream + unified, offline against the fixture cache)
+        # discover picks up tests/test_*.py — the upstream suite AND every
+        # tests/test_unified_*.py including test_unified_coverage.py. The coverage
+        # test needs git+network for its mlx-engine clone (exempt from the offline
+        # policy; it skips rather than fails if the clone can't be made).
+        env:
+          HF_HOME: ${{ github.workspace }}
+          HF_HUB_OFFLINE: "1"
+          METAL_DEVICE_WRAPPER_TYPE: "1"
+          METAL_DEBUG_ERROR_MODE: "0"
+        run: |
+          python -m unittest discover -v tests
+
+      - name: Re-run unified tests explicitly (fork surface must not be skipped)
+        # Belt and braces: fail loudly if the unified modules stopped being
+        # collected (e.g. an import guard silently skipping them in discover).
+        env:
+          HF_HOME: ${{ github.workspace }}
+          HF_HUB_OFFLINE: "1"
+          METAL_DEVICE_WRAPPER_TYPE: "1"
+          METAL_DEBUG_ERROR_MODE: "0"
+        run: |
+          unified=$(cd tests && ls test_unified_*.py | sed 's/\.py$//')
+          echo "unified modules: $unified"
+          python -m unittest -v $(for m in $unified; do echo "tests.$m"; done)

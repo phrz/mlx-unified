@@ -33,6 +33,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .diffusion_generate import is_diffusion_model, stream_diffusion_generate
 from .generate import (
     BatchGenerator,
     SequenceStateMachine,
@@ -750,10 +751,12 @@ class ResponseGenerator:
     def _is_batchable(self, request, args):
         # Image requests take the sequential path: BatchGenerator has no
         # input_embeddings support, and multimodal positions are per-request state.
+        # Diffusion models don't decode autoregressively at all (mlx-unified).
         return (
             self.model_provider.is_batchable
             and args.seed is None
             and not request_has_images(request)
+            and not is_diffusion_model(self.model_provider.model)
         )
 
     def _generate(self):
@@ -1027,6 +1030,13 @@ class ResponseGenerator:
             if args.seed is not None:
                 mx.random.seed(args.seed)
 
+            # mlx-unified: block-diffusion models generate by canvas denoising,
+            # not autoregressively — route around stream_generate (and the LRU
+            # prompt cache, whose entries assume token-by-token AR extension).
+            if is_diffusion_model(model):
+                self._serve_diffusion(rqueue, request, args, model, tokenizer, prompt, ctx, progress)
+                return
+
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
@@ -1043,35 +1053,73 @@ class ResponseGenerator:
             # wider tuple key needs no changes there.
             vision = getattr(request, "vision", None)
             generate_kwargs = {}
+            image_model_key = None
             if vision is not None:
-                image_model_key = (*self.model_provider.model_key, "vision", vision.image_fingerprint)
-                self._log_cache_stats()
-                cache, rest = self.prompt_cache.fetch_nearest_cache(image_model_key, prompt)
-                trimmed = len(prompt) - len(rest)
-                ctx.prompt_cache_count = trimmed
-                cache_key = prompt[:]
-                if cache is None:
+                if vision.bypass_cache:
+                    # v1: the newer capability classes (prefix masks, deepstack,
+                    # cross-attention, visual LoRA, falcon) carry side state that
+                    # doesn't compose with cached-prefix reuse yet — fresh cache,
+                    # nothing inserted afterwards. Correctness first.
+                    self._log_cache_stats()
+                    ctx.prompt_cache_count = 0
+                    rest = prompt
+                    cache_key = None
                     cache = make_prompt_cache(self.model_provider.model)
-                # Keep every per-position array (embeddings/rope positions/token
-                # types) aligned with `rest` — a cache hit means only a TAIL of the
-                # original prompt is actually being prefilled now.
-                vision = vision.sliced(trimmed)
+                else:
+                    image_model_key = (*self.model_provider.model_key, "vision", vision.image_fingerprint)
+                    self._log_cache_stats()
+                    cache, rest = self.prompt_cache.fetch_nearest_cache(image_model_key, prompt)
+                    trimmed = len(prompt) - len(rest)
+                    ctx.prompt_cache_count = trimmed
+                    cache_key = prompt[:]
+                    if cache is None:
+                        cache = make_prompt_cache(self.model_provider.model)
+                    # Keep every per-position array (embeddings/rope positions/token
+                    # types) aligned with `rest` — a cache hit means only a TAIL of the
+                    # original prompt is actually being prefilled now.
+                    vision = vision.sliced(trimmed)
                 generate_kwargs["input_embeddings"] = vision.embeddings
                 if vision.position_ids is not None:
-                    # qwen-family: 3D multimodal rope side state (see models/qwen3_5.py)
+                    # qwen-family: 3D/4D multimodal rope side state (see models/qwen3_5.py)
                     model.model.set_mrope_state(vision.position_ids, vision.rope_deltas)
-                if vision.mm_token_type_ids is not None or vision.per_layer_token_ids:
-                    # gemma4 family: bidirectional image-span masks + explicit
-                    # per-layer inputs (see models/gemma4_text.py)
-                    per_layer = None
-                    if vision.per_layer_token_ids:
-                        per_layer = model.model._get_per_layer_inputs(
-                            mx.array(vision.per_layer_token_ids)[None]
-                        )
-                    model.model.set_visual_state(
-                        mm_token_type_ids=vision.mm_token_type_ids,
-                        per_layer_inputs=per_layer,
+                # Everything else is set_visual_state territory — assemble only the
+                # fields this prompt actually carries (each arch's hook accepts
+                # exactly its own capability's kwargs; see multimodal.TEXT_SIDE).
+                visual_kwargs = {}
+                if vision.mm_token_type_ids is not None:
+                    # gemma4 bidirectional image-span masks / ernie mm-expert routing
+                    visual_kwargs["mm_token_type_ids"] = vision.mm_token_type_ids
+                if vision.per_layer_token_ids:
+                    # gemma4 E2B/E4B explicit per-layer inputs (see models/gemma4_text.py)
+                    visual_kwargs["per_layer_inputs"] = model.model._get_per_layer_inputs(
+                        mx.array(vision.per_layer_token_ids)[None]
                     )
+                if vision.attention_mask_4d is not None:
+                    # prefix-mask family (paligemma/gemma3/moondream) and falcon_ocr
+                    visual_kwargs["attention_mask_4d"] = vision.attention_mask_4d
+                if vision.visual_pos_masks is not None:
+                    # deepstack (qwen3_vl family/granite4_vision) / visual LoRA (zaya1)
+                    visual_kwargs["visual_pos_masks"] = vision.visual_pos_masks
+                if vision.deepstack_visual_embeds is not None:
+                    visual_kwargs["deepstack_visual_embeds"] = vision.deepstack_visual_embeds
+                if vision.deepstack_target_layers is not None:
+                    visual_kwargs["deepstack_target_layers"] = vision.deepstack_target_layers
+                if vision.cross_attention_states is not None:
+                    # mllama interleaved cross-attention (see models/mllama.py)
+                    visual_kwargs["cross_attention_states"] = vision.cross_attention_states
+                    visual_kwargs["cross_attention_mask"] = vision.cross_attention_mask
+                    visual_kwargs["full_text_row_masked_out_mask"] = (
+                        vision.full_text_row_masked_out_mask
+                    )
+                if vision.visual_position_ids is not None:
+                    # falcon_ocr image-collapsed positions + golden 2D coords —
+                    # deliberately NOT vision.position_ids (that would fire the
+                    # mrope branch above; see models/falcon_ocr.py)
+                    visual_kwargs["position_ids"] = vision.visual_position_ids
+                    visual_kwargs["rope_deltas"] = vision.visual_rope_deltas
+                    visual_kwargs["pos_hw"] = vision.pos_hw
+                if visual_kwargs:
+                    model.model.set_visual_state(**visual_kwargs)
             else:
                 # Load the KV cache
                 self._log_cache_stats()
@@ -1085,9 +1133,10 @@ class ResponseGenerator:
                     if self.model_provider.draft_model is not None:
                         cache += make_prompt_cache(self.model_provider.draft_model)
 
-            # An image span must never be split across prefill chunks (gemma4
-            # bidirectional masks are built per forward) — widen to cover whatever's
-            # actually left to prefill (a cache hit may have trimmed the span away).
+            # An image span must never be split across prefill chunks (the
+            # bidirectional edges of gemma4/paligemma/moondream/falcon masks are
+            # unrecoverable once a chunk's KV is written causally) — widen to cover
+            # whatever's actually left to prefill.
             prefill_step_size = self.cli_args.prefill_step_size
             if vision is not None and vision.single_prefill:
                 prefill_step_size = max(len(rest), prefill_step_size)
@@ -1153,6 +1202,68 @@ class ResponseGenerator:
                     inner.reset_mrope_state()
                 if hasattr(inner, "reset_visual_state"):
                     inner.reset_visual_state()
+
+    def _serve_diffusion(
+        self, rqueue, request, args, model, tokenizer, prompt, ctx, progress
+    ):
+        """Serve one request from a block-diffusion model (mlx-unified).
+
+        The denoising loop yields tokens in per-block bursts; every token gets a
+        Response (so usage/logprob accounting stays per-token) but text is
+        carried only on each block's final Response, so streaming clients
+        receive block-sized chunks. Stop words are matched textually at block
+        boundaries — there is no token-by-token decode to hook the state
+        machine into — with a carried tail so a match spanning blocks is still
+        caught. Custom eos ids are handled inside the generator."""
+        if getattr(request, "vision", None) is not None:
+            raise ValueError("Image input is not supported for diffusion models.")
+        if self.model_provider.draft_model is not None:
+            raise ValueError(
+                "Speculative decoding is not supported for diffusion models."
+            )
+
+        stop_words = args.stop_words or []
+        max_stop = max((len(w) for w in stop_words), default=0)
+        tail = ""
+        block_text = ""
+        for gen in stream_diffusion_generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=args.max_tokens,
+            temperature=args.sampling.temperature,
+            prompt_progress_callback=progress,
+            prefill_step_size=self.cli_args.prefill_step_size,
+        ):
+            finish_reason = gen.finish_reason
+            block_text += gen.text
+            flush = gen.block_complete or finish_reason is not None
+            if flush and stop_words:
+                candidate = tail + block_text
+                found = [i for i in (candidate.find(w) for w in stop_words) if i >= 0]
+                if found:
+                    # Truncate at the earliest stop word; empty when the match
+                    # started in already-emitted text.
+                    block_text = candidate[: min(found)][len(tail) :]
+                    finish_reason = "stop"
+                else:
+                    tail = candidate[len(candidate) - max_stop + 1 :] if max_stop > 1 else ""
+            rqueue.put(
+                Response(
+                    block_text if flush else "",
+                    gen.token,
+                    "normal",
+                    None,
+                    gen.logprob,
+                    finish_reason,
+                    (),
+                )
+            )
+            if flush:
+                block_text = ""
+            if ctx._should_stop or finish_reason is not None:
+                break
+        rqueue.put(None)
 
     def generate(
         self,

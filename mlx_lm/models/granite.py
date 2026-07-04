@@ -32,6 +32,14 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = True
 
+    @classmethod
+    def from_dict(cls, params):
+        # granite_vision checkpoints nest the (otherwise identical) granite config
+        # under text_config; hoist it so one file loads both layouts.
+        if "text_config" in params:
+            params = {**params["text_config"], "model_type": params["model_type"]}
+        return super().from_dict(params)
+
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -152,8 +160,15 @@ class GraniteModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        h = self.embed_tokens(inputs) * self.embedding_multiplier
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
+        # MUP scaling applies to injected embeddings too — mlx-vlm's granite_vision
+        # merges raw embed_tokens output with image features and scales afterwards.
+        h = h * self.embedding_multiplier
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -180,8 +195,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -193,6 +209,14 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
+        # granite_vision checkpoints: drop the vision tower and unwrap language_model.*
+        weights = {
+            k.removeprefix("language_model."): v
+            for k, v in weights.items()
+            if not k.startswith(
+                ("vision_tower.", "multi_modal_projector.", "image_newline")
+            )
+        }
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         return weights

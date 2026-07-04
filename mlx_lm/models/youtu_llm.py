@@ -195,8 +195,12 @@ class YoutuLLMModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        h = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -221,8 +225,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings)
         if self.config.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -230,6 +235,29 @@ class Model(nn.Module):
         return out
 
     def sanitize(self, weights):
+        # Youtu-VL (VLM) checkpoints: drop the vision tower (siglip2.*/merger.* in
+        # the original layout, vision_tower.* in mlx-vlm conversions) and unwrap
+        # the text weights the latter nest under language_model.*
+        weights = {
+            k.removeprefix("language_model."): v
+            for k, v in weights.items()
+            if not k.startswith(("vision_tower.", "siglip2.", "merger."))
+        }
+
+        # mlx-vlm conversions split kv_b_proj into per-head embed_q/unembed_out
+        # (absorbed MLA); rebuild the joint projection this model computes with.
+        for k in [k for k in weights if k.endswith(".embed_q.weight")]:
+            prefix = k.removesuffix(".embed_q.weight")
+            if f"{prefix}.embed_q.scales" in weights:
+                raise ValueError(
+                    "quantized Youtu-VL conversions store absorbed MLA projections "
+                    "that cannot be rebuilt — requantize from a bf16 checkpoint"
+                )
+            wk = weights.pop(k)
+            wv = weights.pop(f"{prefix}.unembed_out.weight")
+            kv_b = mx.concatenate([wk.swapaxes(-1, -2), wv], axis=1)
+            weights[f"{prefix}.kv_b_proj.weight"] = kv_b.flatten(0, 1)
+
         if self.config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         return weights

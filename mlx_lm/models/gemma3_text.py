@@ -32,6 +32,24 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Dict = None
 
 
+def _overlay_prefix_mask(base_mask: mx.array, prefix_mask: mx.array) -> mx.array:
+    """OR the vision forward's bidirectional prefix edges onto a boolean causal
+    mask. mlx-vlm's gemma3 drives EVERY layer — sliding included — with the
+    padding-derived bidirectional mask over the whole prompt, so composing it
+    onto each base mask (gemma4_text's overlay convention: query rows are the
+    LAST rows, keys the last columns — a rotating cache keeps the sequence tail)
+    reproduces that while keeping each mask's cache-aware (query, key) geometry.
+    A prefix mask that does not cover the base extent (a cached-prefix tail)
+    stays causal."""
+    query_len, key_len = base_mask.shape[-2], base_mask.shape[-1]
+    if prefix_mask.shape[-2] < query_len or prefix_mask.shape[-1] < key_len:
+        return base_mask
+    edges = prefix_mask[..., -query_len:, -key_len:].astype(mx.bool_)
+    if edges.ndim == 4 and edges.shape[0] == 1 and edges.shape[1] == 1:
+        edges = edges[0, 0]  # 2D broadcasts like the causal base mask
+    return base_mask | edges
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -176,6 +194,15 @@ class Gemma3Model(nn.Module):
             for layer_idx in range(args.num_hidden_layers)
         ]
         self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        # Multimodal side state (mlx-unified), set by the vision path before
+        # generation and cleared afterwards. Underscore attr — never a parameter.
+        self._mm_attention_mask_4d = None
+
+    def set_visual_state(self, attention_mask_4d: Optional[mx.array] = None) -> None:
+        self._mm_attention_mask_4d = attention_mask_4d
+
+    def reset_visual_state(self) -> None:
+        self._mm_attention_mask_4d = None
 
     def __call__(
         self,
@@ -192,16 +219,32 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        global_mask = create_attention_mask(h, cache[self.sliding_window_pattern - 1])
+        # gemma3 vision prefill: the whole prompt attends bidirectionally (the
+        # padding-derived mask supersedes the local causal band, per mlx-vlm);
+        # decode steps (single token) revert to normal causal/sliding behavior.
+        prefix_mask = self._mm_attention_mask_4d
+        use_prefix = prefix_mask is not None and h.shape[1] > 1
+
+        global_mask = create_attention_mask(
+            h, cache[self.sliding_window_pattern - 1], return_array=use_prefix
+        )
 
         if self.sliding_window_pattern > 1:
             sliding_window_mask = create_attention_mask(
                 h,
                 cache[0],
                 window_size=self.window_size,
+                return_array=use_prefix,
             )
         else:
             sliding_window_mask = None
+
+        if use_prefix:
+            global_mask = _overlay_prefix_mask(global_mask, prefix_mask)
+            if sliding_window_mask is not None:
+                sliding_window_mask = _overlay_prefix_mask(
+                    sliding_window_mask, prefix_mask
+                )
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             is_global = (
                 i % self.sliding_window_pattern == self.sliding_window_pattern - 1

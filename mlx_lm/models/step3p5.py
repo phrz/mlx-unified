@@ -62,6 +62,20 @@ class ModelArgs(BaseModelArgs):
     swiglu_limits_shared: Optional[List[float]] = None
     tie_word_embeddings: bool = False
 
+    @classmethod
+    def from_dict(cls, params):
+        # step3p7 (VLM) checkpoints nest this config under text_config; hoist it so
+        # one file loads both layouts. Their per-path quantization overrides are
+        # keyed on the language_model.* tree that sanitize() unwraps — rewrite them
+        # in place so load-time quantization still finds them.
+        if "text_config" in params:
+            quant = params.get("quantization")
+            if isinstance(quant, dict):
+                for k in [k for k in quant if k.startswith("language_model.")]:
+                    quant[k.removeprefix("language_model.")] = quant.pop(k)
+            params = {**params["text_config"], "model_type": params["model_type"]}
+        return super().from_dict(params)
+
 
 class ZeroCenteredRMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1e-5):
@@ -349,8 +363,12 @@ class Step3p5Model(nn.Module):
         self,
         x: mx.array,
         cache: Optional[List[Any]] = None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        h = self.embed_tokens(x)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(x)
 
         if cache is None:
             cache = [None] * self.num_layers
@@ -385,8 +403,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[List[Any]] = None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings)
         return self.lm_head(out)
 
     @property
@@ -404,6 +423,13 @@ class Model(nn.Module):
         ]
 
     def sanitize(self, weights):
+        # step3p7 (VLM) checkpoints: drop the vision tower and unwrap the text
+        # weights that mlx-vlm conversions nest under language_model.*
+        weights = {
+            k.removeprefix("language_model."): v
+            for k, v in weights.items()
+            if not k.startswith(("vision_model.", "vit_large_projector."))
+        }
         remappings = [
             (".moe.gate_proj.", ".mlp.switch_mlp.gate_proj."),
             (".moe.up_proj.", ".mlp.switch_mlp.up_proj."),

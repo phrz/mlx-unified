@@ -53,6 +53,29 @@ MODEL_REMAPPING = {
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    # mlx-unified: VLM checkpoints whose text side loads via an existing/added module
+    # (vision towers stripped by each module's sanitize(); vision runs via the bridge).
+    "granite_vision": "granite",
+    "granite-vision": "granite",
+    "granite4_vision": "granitemoehybrid",
+    "jvlm": "jina_vlm",
+    "molmo2_text": "molmo2",
+    "deepseekocr_2": "deepseekocr",
+    "unlimited-ocr": "unlimited_ocr",
+    "step3p7": "step3p5",
+    "youtu_vl": "youtu_llm",
+    "qwen3_vl_text": "qwen3_vl",
+    "qwen3_vl_moe_text": "qwen3_vl_moe",
+    "nemotron_h_nano_omni": "nemotron_h",
+    "ernie4_5_moe_vl": "ernie4_5_moe",
+    "glm4v": "glm4v_text",
+    "glm_ocr": "glm4v_text",
+    "glm_ocr_text": "glm4v_text",
+    "glm4v_moe": "glm4_moe",
+    "glm4v_moe_text": "glm4_moe",
+    "minimax_m3_vl": "minimax_m3",
+    # paligemma is handled in _get_classes: PaliGemma 1 → gemma, PaliGemma 2 → gemma2
+    # (same top-level model_type, different text_config.model_type).
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -184,6 +207,10 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
+    if model_type == "paligemma":
+        # PaliGemma 1 and 2 share a top-level model_type; only text_config distinguishes
+        # the gemma vs gemma2 body, so a static remap can't dispatch this one.
+        model_type = (config.get("text_config") or {}).get("model_type", "gemma")
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")

@@ -601,6 +601,11 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         weights = tree_unflatten(list(weights.items()))
+        # mlx-vlm conversions store the language model as language_model.model.*
+        # (HF checkpoints nest it as model.language_model.*); normalize to the
+        # latter, implicitly dropping the sibling vision/audio towers.
+        if "model" not in weights and "language_model" in weights:
+            weights = {"model": {"language_model": weights["language_model"]["model"]}}
         for k in ["vision_tower", "audio_tower", "embed_audio", "embed_vision"]:
             weights["model"].pop(k, None)
         return dict(tree_flatten(weights))

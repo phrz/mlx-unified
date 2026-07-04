@@ -60,6 +60,15 @@ class ModelArgs(BaseModelArgs):
     # Map from layers_block_type names to single-char pattern codes
     _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
 
+    @classmethod
+    def from_dict(cls, params):
+        # nemotron_h_nano_omni checkpoints nest the language config under
+        # text_config (or llm_config); hoist it so one file loads both layouts.
+        nested = params.get("text_config") or params.get("llm_config")
+        if nested is not None:
+            params = {**nested, "model_type": params["model_type"]}
+        return super().from_dict(params)
+
     def __post_init__(self):
         if self.time_step_limit is None:
             self.time_step_limit = (0.0, float("inf"))
@@ -481,8 +490,12 @@ class NemotronHModel(nn.Module):
         self,
         inputs,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        hidden_states = self.embeddings(inputs)
+        if input_embeddings is not None:
+            hidden_states = input_embeddings
+        else:
+            hidden_states = self.embeddings(inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -518,8 +531,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.backbone(inputs, cache=cache)
+        out = self.backbone(inputs, cache=cache, input_embeddings=input_embeddings)
         return self.lm_head(out)
 
     @property
@@ -536,6 +550,14 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
+        # nemotron_h_nano_omni checkpoints: keep only the language model (drop the
+        # vision/sound towers and projectors) and unwrap the language_model.* prefix.
+        if any(k.startswith("language_model.") for k in weights):
+            weights = {
+                k.removeprefix("language_model."): v
+                for k, v in weights.items()
+                if k.startswith("language_model.")
+            }
         weights = {k: v for (k, v) in weights.items() if not k.startswith("mtp.")}
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:

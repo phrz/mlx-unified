@@ -221,8 +221,12 @@ class LlamaModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        h = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
 
         if cache is not None:
             for idx, c in enumerate(cache):
@@ -269,8 +273,9 @@ class LanguageModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings)
         return self.lm_head(out)
 
 
@@ -285,8 +290,9 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        return self.language_model(inputs, cache)
+        return self.language_model(inputs, cache, input_embeddings)
 
     def sanitize(self, weights):
         def to_remove(k):

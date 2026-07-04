@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -141,8 +142,11 @@ class PhiModel(nn.Module):
             config.hidden_size, eps=config.layer_norm_eps
         )
 
-    def __call__(self, x, cache):
-        x = self.embed_tokens(x)
+    def __call__(self, x, cache, input_embeddings: Optional[mx.array] = None):
+        if input_embeddings is not None:
+            x = input_embeddings
+        else:
+            x = self.embed_tokens(x)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -165,8 +169,9 @@ class Model(nn.Module):
         self,
         x: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        y = self.model(x, cache)
+        y = self.model(x, cache, input_embeddings)
         return self.lm_head(y)
 
     @property

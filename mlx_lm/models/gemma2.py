@@ -16,15 +16,47 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
-    head_dim: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: int
+    head_dim: int = 256
+    rms_norm_eps: float = 1e-6
+    vocab_size: int = 256000
+    num_key_value_heads: Optional[int] = None
     rope_theta: float = 10000
     rope_traditional: bool = False
     attn_logit_softcapping: float = 50.0
     final_logit_softcapping: float = 30.0
     query_pre_attn_scalar: float = 144.0
+
+    def __post_init__(self):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+
+    @classmethod
+    def from_dict(cls, params):
+        # PaliGemma 2 checkpoints nest the text model's params under text_config
+        # (the top-level model_type stays "paligemma"); the defaults above cover
+        # the fields sparse configs omit (head_dim, rms_norm_eps).
+        text_config = params.get("text_config")
+        if text_config:
+            params = {
+                **params,
+                **{k: v for k, v in text_config.items() if k != "model_type"},
+            }
+        return super().from_dict(params)
+
+
+def _overlay_prefix_mask(base_mask: mx.array, prefix_mask: mx.array) -> mx.array:
+    """OR the vision forward's bidirectional prefix edges onto a boolean causal
+    mask (PaliGemma prefill: every non-pad prompt position attends to every
+    other). Query rows are the LAST rows of the prompt-wide prefix mask and keys
+    its last columns (gemma4_text's overlay slicing convention); a prefix mask
+    that does not cover the base extent (a cached-prefix tail) stays causal."""
+    query_len, key_len = base_mask.shape[-2], base_mask.shape[-1]
+    if prefix_mask.shape[-2] < query_len or prefix_mask.shape[-1] < key_len:
+        return base_mask
+    edges = prefix_mask[..., -query_len:, -key_len:].astype(mx.bool_)
+    if edges.ndim == 4 and edges.shape[0] == 1 and edges.shape[1] == 1:
+        edges = edges[0, 0]  # 2D broadcasts like the causal base mask
+    return base_mask | edges
 
 
 class RMSNorm(nn.Module):
@@ -161,19 +193,38 @@ class GemmaModel(nn.Module):
             TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
         ]
         self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        # Multimodal side state (mlx-unified), set by the vision path before
+        # generation and cleared afterwards. Underscore attr — never a parameter.
+        self._mm_attention_mask_4d = None
+
+    def set_visual_state(self, attention_mask_4d: Optional[mx.array] = None) -> None:
+        self._mm_attention_mask_4d = attention_mask_4d
+
+    def reset_visual_state(self) -> None:
+        self._mm_attention_mask_4d = None
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        h = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            h = input_embeddings
+        else:
+            h = self.embed_tokens(inputs)
         h = h * (self.args.hidden_size**0.5)
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         mask = create_attention_mask(h, cache[0], return_array=True)
+
+        # PaliGemma 2 vision prefill: the whole prompt attends bidirectionally;
+        # decode steps (single token) revert to normal causal behavior.
+        prefix_mask = self._mm_attention_mask_4d
+        if prefix_mask is not None and h.shape[1] > 1:
+            mask = _overlay_prefix_mask(mask, prefix_mask)
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -193,12 +244,27 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, input_embeddings)
         out = self.model.embed_tokens.as_linear(out)
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping
         return out
+
+    def sanitize(self, weights):
+        # PaliGemma 2 checkpoints (mlx-vlm conversions) wrap this model as their
+        # text tower — drop the vision side, remap language_model.* onto this
+        # module tree, and drop any materialized (tied) lm_head.
+        sanitized = {}
+        for k, v in weights.items():
+            if k.startswith(("vision_tower.", "multi_modal_projector.")):
+                continue
+            k = k.removeprefix("language_model.")
+            if k.startswith("lm_head.") or "self_attn.rotary_emb.inv_freq" in k:
+                continue
+            sanitized[k] = v
+        return sanitized
 
     @property
     def layers(self):
