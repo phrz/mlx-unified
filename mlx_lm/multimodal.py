@@ -32,6 +32,7 @@ import binascii
 import hashlib
 import io
 import json
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Union
@@ -67,6 +68,15 @@ import mlx.core as mx
 #   "falcon-visual" — falcon_ocr: image-collapsed 1D positions + per-head golden
 #             2D rotary coords + a block-diagonal bidirectional mask, all via
 #             set_visual_state (NOT set_mrope_state); single-call prefill.
+#   "molmo-point" — molmo_point: plain injection PLUS six side-state tensors
+#             (pooling maps, gathered ViT features, connector features, image-
+#             token masks) that mlx-vlm stashes on its Model._image_cache during
+#             get_input_embeddings, consumed via set_visual_state — the text
+#             model computes the extended point-vocab logits in-model
+#             (see models/molmo_point.py). Patch-key capture is chunked-prefill-
+#             safe but indexed by ABSOLUTE prompt position, so these prompts
+#             bypass the prompt cache (a trimmed prefill would leave the patch
+#             keys permanently incomplete).
 TEXT_SIDE = {
     "qwen3_5": "mrope",
     "qwen3_5_moe": "mrope",
@@ -92,6 +102,7 @@ TEXT_SIDE = {
     "mllama": "cross-attention",
     "zaya1_vl": "visual-lora",
     "falcon_ocr": "falcon-visual",
+    "molmo_point": "molmo-point",
 }
 
 # model_types whose qwen-style mrope positions we build ourselves (multi-image-correct)
@@ -120,6 +131,9 @@ MROPE_SIDES = ("mrope", "ernie-visual", "mrope+deepstack")
 # image-fingerprinted prompt cache — the server runs these with a FRESH cache every
 # request and inserts nothing (correctness first; cache reuse is a later
 # optimization). mrope/plain/gemma-visual keep the existing cache path.
+# molmo-point is a hard requirement, not a v1 shortcut: patch keys are captured
+# from the prefill's hidden states at every image position, so a cache-trimmed
+# prefill would leave them incomplete and the model raises on the first decode.
 BYPASS_CACHE_SIDES = (
     "attn-mask-4d",
     "mrope+deepstack",
@@ -127,6 +141,7 @@ BYPASS_CACHE_SIDES = (
     "cross-attention",
     "visual-lora",
     "falcon-visual",
+    "molmo-point",
 )
 
 # InputEmbeddingsFeatures fields that change forward semantics if dropped: consumed
@@ -160,13 +175,14 @@ def load_vision_encoder(model_path):
         return None
     # qwen3_omni_moe nests everything under thinker_config; falcon_ocr's flat TII
     # config has no vision_config at all (early fusion — vision lives inside the
-    # language_model weights). molmo v1 flat configs also lack vision_config, but
-    # there vision is genuinely unusable (mlx-vlm cannot load those conversions
-    # either), so they stay text-only.
+    # language_model weights). molmo v1 conversions (e.g. Molmo-7B-D-0924) ship a
+    # FLAT config with no vision_config either, yet carry full vision_tower.*
+    # weights (mlx-vlm loads them from dataclass defaults) — exempt both; the
+    # weight guard in _ensure_loaded still refuses vision-stripped conversions.
     if (
         "vision_config" not in config
         and "vision_config" not in (config.get("thinker_config") or {})
-        and config.get("model_type") != "falcon_ocr"
+        and config.get("model_type") not in ("falcon_ocr", "molmo")
     ):
         return None
     return MlxVlmBridge(model_path, config)
@@ -241,6 +257,25 @@ class VisionPrompt:
     visual_position_ids: Optional[mx.array] = None  # (1, L) int
     visual_rope_deltas: Optional[mx.array] = None  # (1, 1)
     pos_hw: Optional[mx.array] = None  # (1, L, 2) golden h/w coordinates
+    # molmo-point (molmo_point): the six tensors mlx-vlm stashes on its
+    # Model._image_cache during get_input_embeddings, consumed via
+    # set_visual_state (see models/molmo_point.py). Indexed by ABSOLUTE prompt
+    # position / pooled-row order — never sliced (these prompts always bypass
+    # the prompt cache, see BYPASS_CACHE_SIDES).
+    token_pooling: Optional[mx.array] = None  # (B, P, S) int32, -1 = padding
+    vit_features: Optional[mx.array] = None  # (B, P, S, vit_dim) gathered ViT features
+    image_features: Optional[mx.array] = None  # (n_image_tokens, 1, hidden) connector out
+    image_token_offsets: Optional[mx.array] = None  # (B,) offsets into image_features
+    is_image_token: Optional[mx.array] = None  # (B, L) bool over the full prompt
+    is_indexable_image_token: Optional[mx.array] = None  # (B, L) bool
+    # First extended point id (== the model's total vocab size): a sampled id
+    # >= this is a point token whose canonical text is '<POINT_{id - start}>'
+    # — for the shipped checkpoint family the tokenizer carries those very ids
+    # as added tokens, so ordinary detokenization already produces that text.
+    point_id_start: Optional[int] = None
+    # Processor pooling metadata (+ the two config flags extract_image_points
+    # needs) for server-side point -> pixel-coordinate conversion.
+    pointing_metadata: Optional[dict] = None
     single_prefill: bool = False  # image span must sit in ONE prefill forward
     # v1: this prompt's side state doesn't compose with the prompt cache yet (see
     # BYPASS_CACHE_SIDES) — the server runs it with a fresh cache, no reuse.
@@ -363,6 +398,20 @@ class MlxVlmBridge:
         self._vlm = load_model(self.model_path, lazy=True, strict=False)
         self._processor = load_processor(self.model_path)
 
+    def _qwen3_omni_tower_features(self, pixel_values, image_grid_thw):
+        """One qwen3_omni_moe vision-tower pass, the thinker's way (same dtype
+        cast): returns (embeds, multiscale) — multiscale is the per-deepstack-layer
+        feature tuple the tower emits alongside the main embeddings, or None if
+        the tower returned a bare array."""
+        thinker = self._vlm.thinker
+        pixel_values = pixel_values.astype(
+            thinker.vision_tower.patch_embed.proj.weight.dtype
+        )
+        out = thinker.vision_tower(pixel_values, image_grid_thw)
+        if isinstance(out, tuple):
+            return out
+        return out, None
+
     def prepare(self, rendered_prompt: str, images: List[str]) -> VisionPrompt:
         """(chat-template-rendered prompt text, image payloads) → VisionPrompt."""
         from mlx_vlm.utils import prepare_inputs
@@ -383,6 +432,24 @@ class MlxVlmBridge:
             for k, v in inputs.items()
             if k not in ("input_ids", "pixel_values", "attention_mask")
         }
+        # qwen3_omni_moe wiring gap: mlx-vlm's thinker COMPUTES the vision tower's
+        # multiscale (deepstack) features but returns deepstack_visual_embeds=None.
+        # For image prompts, run the tower ONCE ourselves, keep the multiscale
+        # tuple, and hand the main embeddings back via cached_image_features so
+        # the thinker skips its own tower pass (no double run). Video prompts
+        # stay on the degraded no-deepstack path: the thinker has no cached-
+        # features hook for its video branch, and pre-empting only the image
+        # tower would break the image/video multiscale join.
+        omni_multiscale = None
+        if (
+            self.model_type == "qwen3_omni_moe"
+            and inputs.get("pixel_values") is not None
+            and inputs.get("pixel_values_videos") is None
+        ):
+            cached, omni_multiscale = self._qwen3_omni_tower_features(
+                inputs["pixel_values"], inputs.get("image_grid_thw")
+            )
+            extra["cached_image_features"] = cached
         feats = self._vlm.get_input_embeddings(
             input_ids,
             inputs.get("pixel_values"),
@@ -418,6 +485,14 @@ class MlxVlmBridge:
         visual_position_ids = None
         visual_rope_deltas = None
         pos_hw = None
+        token_pooling = None
+        vit_features = None
+        image_features = None
+        image_token_offsets = None
+        is_image_token = None
+        is_indexable_image_token = None
+        point_id_start = None
+        pointing_metadata = None
         single_prefill = False
 
         if self.model_type in QWEN_MROPE_TYPES:
@@ -492,11 +567,18 @@ class MlxVlmBridge:
 
         elif side == "mrope+deepstack":
             # qwen3_vl family: mrope (built above) + mid-layer visual injection.
-            # deepstack_visual_embeds may be absent/None (qwen3_omni_moe's mlx-vlm
-            # port doesn't return the tower's multiscale features yet) — injection
-            # then simply doesn't fire; mrope + the embedding splice still apply.
             visual_pos_masks = getattr(feats, "visual_pos_masks", None)
             deepstack_visual_embeds = getattr(feats, "deepstack_visual_embeds", None)
+            if deepstack_visual_embeds is None and omni_multiscale is not None:
+                # qwen3_omni_moe: wire in the multiscale tuple from our own tower
+                # run — one (n_visual, hidden) table per deepstack layer, rows in
+                # prompt order of the visual_pos_masks positions. An mlx-vlm that
+                # returns the tables itself takes precedence (branch not taken);
+                # video prompts (no tuple) keep the degraded no-deepstack path,
+                # where mrope + the embedding splice still apply.
+                deepstack_visual_embeds = [
+                    table.astype(embeds.dtype) for table in omni_multiscale
+                ]
 
         elif side == "granite-deepstack":
             # granite4_vision: inputs_embeds arrive UNSCALED with image positions
@@ -539,6 +621,41 @@ class MlxVlmBridge:
             attention_mask_4d = feats.attention_mask_4d
             single_prefill = True
 
+        elif side == "molmo-point":
+            # molmo_point: get_input_embeddings returns ONLY inputs_embeds but
+            # stashes the point-prediction side state on Model._image_cache —
+            # the six tensors below reach the text model via set_visual_state
+            # (see models/molmo_point.py). Extended point ids start at the
+            # model's total vocab; the processor's pooling metadata (stashed on
+            # the processor itself during prepare_inputs) lets the server turn
+            # generated point runs back into pixel coordinates.
+            image_cache = getattr(self._vlm, "_image_cache", None)
+            if image_cache is None:
+                raise ValueError(
+                    "molmo_point: mlx-vlm's get_input_embeddings left no "
+                    "_image_cache — the point-prediction side state is "
+                    "unavailable for this prompt"
+                )
+            token_pooling = image_cache["token_pooling"]
+            vit_features = image_cache["vit_features"]
+            image_features = image_cache["image_features"]
+            image_token_offsets = image_cache["image_token_offsets"]
+            is_image_token = image_cache["is_image_token"]
+            is_indexable_image_token = image_cache["is_indexable_image_token"]
+            text_cfg = self.config.get("text_config") or self.config
+            point_id_start = text_cfg.get("vocab_size", 151936) + text_cfg.get(
+                "additional_vocab_size", 128
+            )
+            meta = getattr(self._processor, "_pointing_metadata", None)
+            if meta is not None and meta.get("token_pooling") is not None:
+                pointing_metadata = {
+                    **meta,
+                    "no_more_points_class": self.config.get(
+                        "no_more_points_class", True
+                    ),
+                    "patch_location": self.config.get("patch_location", "3x3"),
+                }
+
         if position_ids is not None and side not in MROPE_SIDES:
             raise ValueError(
                 f'architecture "{self.model_type}" requires multimodal position support '
@@ -562,6 +679,14 @@ class MlxVlmBridge:
             visual_position_ids=visual_position_ids,
             visual_rope_deltas=visual_rope_deltas,
             pos_hw=pos_hw,
+            token_pooling=token_pooling,
+            vit_features=vit_features,
+            image_features=image_features,
+            image_token_offsets=image_token_offsets,
+            is_image_token=is_image_token,
+            is_indexable_image_token=is_indexable_image_token,
+            point_id_start=point_id_start,
+            pointing_metadata=pointing_metadata,
             single_prefill=single_prefill,
             bypass_cache=side in BYPASS_CACHE_SIDES,
             image_fingerprint=image_fingerprint(images),
@@ -654,3 +779,72 @@ def _find_token_runs(tokens: List[int], target_token: int) -> List[tuple]:
     if start is not None:
         runs.append((start, len(tokens)))
     return runs
+
+
+# --- MolmoPoint point extraction -------------------------------------------
+# Adapted from mlx-vlm's models/molmo_point/point_utils.py (MIT © Blaizzy/
+# mlx-vlm contributors): a generated point run is <POINT_p><POINT_s><POINT_l>
+# followed by the model-emitted example-id digits; the processor's pooling
+# metadata maps (p, s) to a ViT patch cell in each image's grid, l refines
+# within the cell on a 3x3 grid, and the grid scales to the image's pixels.
+
+POINT_TRIPLE_RE = re.compile(r"<POINT_(\d+)> ?<POINT_(\d+)> ?<POINT_(\d+)> ?([0-9]+)")
+
+
+def extract_image_points(text: str, pointing: dict) -> List[tuple]:
+    """MolmoPoint output text → [(example_id, image_ix, x_px, y_px)] using the
+    pooling metadata carried on VisionPrompt.pointing_metadata (built in
+    MlxVlmBridge.prepare's molmo-point branch). Malformed runs whose ids fall
+    outside the pooling table are skipped rather than raised — the in-model
+    ordering mask makes them impossible for real generations."""
+    import numpy as np
+
+    pooling = pointing["token_pooling"]  # (P, S) ViT patch ids, -1 = padding
+    n_patches, n_subpatches = pooling.shape[-2:]
+    if pointing.get("no_more_points_class", True):
+        n_patches += 1
+    patch_location = pointing.get("patch_location", "3x3")
+
+    points = []
+    for match in POINT_TRIPLE_RE.finditer(text):
+        patch_id, subpatch_num, location_num, example_id = map(int, match.groups())
+        subpatch_id = subpatch_num - n_patches
+        location_id = (
+            location_num - n_patches - n_subpatches if patch_location else None
+        )
+        if not (0 <= patch_id < pooling.shape[0] and 0 <= subpatch_id < n_subpatches):
+            continue
+        vit_patch_id = int(pooling[patch_id, subpatch_id])
+        for image_ix, (mapping, (w, h)) in enumerate(
+            zip(pointing["subpatch_mapping"], pointing["image_sizes"])
+        ):
+            cells = np.argwhere(mapping == vit_patch_id)
+            if len(cells) == 1:
+                p_y, p_x = cells[0]
+                if location_id is not None:
+                    p_x += (location_id // 3 + 0.5) * 0.33
+                    p_y += (location_id % 3 + 0.5) * 0.33
+                else:
+                    p_x += 0.5
+                    p_y += 0.5
+                points.append(
+                    (
+                        example_id,
+                        image_ix,
+                        float(p_x / mapping.shape[1] * w),
+                        float(p_y / mapping.shape[0] * h),
+                    )
+                )
+                break
+    return points
+
+
+def render_image_points(points: List[tuple]) -> str:
+    """Extracted points as trailing text in Molmo's <point .../> XML style —
+    empty when there are none, so pointless generations gain nothing."""
+    if not points:
+        return ""
+    return "\n" + "".join(
+        f'<point id="{ex}" image="{img}" x="{x:.1f}" y="{y:.1f}"/>'
+        for ex, img, x, y in points
+    )

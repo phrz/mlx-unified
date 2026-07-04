@@ -43,8 +43,14 @@ from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
 )
-from .multimodal import images_from_message_content, load_vision_encoder
+from .multimodal import (
+    extract_image_points,
+    images_from_message_content,
+    load_vision_encoder,
+    render_image_points,
+)
 from .sample_utils import make_logits_processors, make_sampler
+from .tokenizer_utils import StreamingDetokenizer, TokenizerWrapper
 from .utils import _download, _parse_size, load, sharded_load
 
 
@@ -473,6 +479,47 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
         {"id": i, "token": s, "logprob": g}
         for i, s, g in zip(top_indices, txts, top_probs)
     )
+
+
+class PointStreamingDetokenizer(StreamingDetokenizer):
+    """mlx-unified fallback for molmo_point conversions whose tokenizer lacks
+    the <POINT_k> added tokens: extended point ids (>= the model's total vocab)
+    would break the underlying detokenizer, so hold them back from it and emit
+    their canonical '<POINT_{k}>' text directly — byte-identical to what a
+    covering tokenizer decodes. The shipped checkpoint family never needs this
+    (its tokenizer carries the extended ids as added tokens, extended id ==
+    tokenizer id), so _serve_single only installs it when the tokenizer probe
+    for '<POINT_0>' fails."""
+
+    def __init__(self, detokenizer, point_id_start):
+        self._detokenizer = detokenizer
+        self._point_id_start = point_id_start
+        self.reset()
+
+    def reset(self):
+        self._detokenizer.reset()
+        self.offset = 0
+        self.text = ""
+        self.tokens = []
+
+    def _drain(self):
+        self.text += self._detokenizer.last_segment
+
+    def add_token(self, token):
+        self.tokens.append(token)
+        if token >= self._point_id_start:
+            # flush the inner detokenizer's pending text first so the point
+            # text lands in stream order, then bypass it entirely
+            self._detokenizer.finalize()
+            self._drain()
+            self.text += f"<POINT_{token - self._point_id_start}>"
+        else:
+            self._detokenizer.add_token(token)
+            self._drain()
+
+    def finalize(self):
+        self._detokenizer.finalize()
+        self._drain()
 
 
 class ResponseGenerator:
@@ -1054,6 +1101,8 @@ class ResponseGenerator:
             vision = getattr(request, "vision", None)
             generate_kwargs = {}
             image_model_key = None
+            gen_tokenizer = tokenizer
+            point_text = None
             if vision is not None:
                 if vision.bypass_cache:
                     # v1: the newer capability classes (prefix masks, deepstack,
@@ -1118,8 +1167,46 @@ class ResponseGenerator:
                     visual_kwargs["position_ids"] = vision.visual_position_ids
                     visual_kwargs["rope_deltas"] = vision.visual_rope_deltas
                     visual_kwargs["pos_hw"] = vision.pos_hw
+                if vision.token_pooling is not None:
+                    # molmo_point in-model point-token generation: the six
+                    # tensors mlx-vlm stashed on its Model._image_cache
+                    # (see models/molmo_point.py)
+                    visual_kwargs["token_pooling"] = vision.token_pooling
+                    visual_kwargs["vit_features"] = vision.vit_features
+                    visual_kwargs["image_features"] = vision.image_features
+                    visual_kwargs["image_token_offsets"] = vision.image_token_offsets
+                    visual_kwargs["is_image_token"] = vision.is_image_token
+                    visual_kwargs["is_indexable_image_token"] = (
+                        vision.is_indexable_image_token
+                    )
                 if visual_kwargs:
                     model.model.set_visual_state(**visual_kwargs)
+                # molmo_point samples EXTENDED ids (>= the model's total vocab)
+                # for point tokens. The shipped tokenizer family carries matching
+                # <POINT_k> added tokens (extended id == tokenizer id), so
+                # streaming decode works unchanged; only a conversion WITHOUT
+                # them needs the fallback detokenizer. Point runs additionally
+                # get pixel coordinates emitted as a trailing chunk (see the
+                # post-loop block) when the processor supplied pooling metadata.
+                if vision.point_id_start is not None:
+                    if vision.pointing_metadata is not None:
+                        point_text = ""
+                    try:
+                        covered = (
+                            tokenizer.convert_ids_to_tokens(vision.point_id_start)
+                            == "<POINT_0>"
+                        )
+                    except (IndexError, KeyError, OverflowError, ValueError):
+                        covered = False
+                    if not covered:
+                        inner_class = tokenizer._detokenizer_class
+                        gen_tokenizer = TokenizerWrapper(
+                            tokenizer._tokenizer,
+                            detokenizer_class=lambda t: PointStreamingDetokenizer(
+                                inner_class(t), vision.point_id_start
+                            ),
+                            eos_token_ids=tokenizer._eos_token_ids,
+                        )
             else:
                 # Load the KV cache
                 self._log_cache_stats()
@@ -1144,7 +1231,7 @@ class ResponseGenerator:
             # Process the prompt and generate tokens
             for gen in stream_generate(
                 model=model,
-                tokenizer=tokenizer,
+                tokenizer=gen_tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
                 sampler=sampler,
@@ -1160,6 +1247,8 @@ class ResponseGenerator:
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
                 if match_sequence is not None and current_state is None:
                     finish_reason = "stop"
+                if point_text is not None:
+                    point_text += gen.text
                 rqueue.put(
                     Response(
                         gen.text,
@@ -1183,6 +1272,23 @@ class ResponseGenerator:
 
                 if finish_reason is not None:
                     break
+
+            if point_text:
+                # molmo_point coordinate post-process: the pooling/mapping
+                # metadata that turns <POINT_p><POINT_s><POINT_l> runs into
+                # pixels exists only server-side, so an OpenAI-API client can't
+                # compute them — emit the extracted pixel coordinates as ONE
+                # extra trailing chunk. A separate Response (not an append to
+                # the final chunk) because a generation ending on a stop match —
+                # EOS included — has that chunk's text blanked downstream by
+                # _process_control_tokens.
+                rendered = render_image_points(
+                    extract_image_points(point_text, vision.pointing_metadata)
+                )
+                if rendered and not ctx._should_stop:
+                    rqueue.put(
+                        Response(rendered, gen.token, "normal", None, 0.0, None, ())
+                    )
 
             rqueue.put(None)
 

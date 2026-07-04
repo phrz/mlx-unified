@@ -93,6 +93,7 @@ class TestTextSideRegistry(unittest.TestCase):
             "mllama": "cross-attention",
             "zaya1_vl": "visual-lora",
             "falcon_ocr": "falcon-visual",
+            "molmo_point": "molmo-point",
         }
         for arch, capability in expected.items():
             self.assertEqual(TEXT_SIDE.get(arch), capability, arch)
@@ -144,7 +145,8 @@ class TestTextSideRegistry(unittest.TestCase):
         # the pre-existing paths keep the image-fingerprinted prompt cache…
         for side in ("mrope", "gemma-visual", "gemma3n-visual", "ernie-visual"):
             self.assertNotIn(side, BYPASS_CACHE_SIDES, side)
-        # …every new capability class bypasses it for v1
+        # …every new capability class bypasses it for v1 (molmo-point bypasses
+        # by necessity: patch keys index ABSOLUTE prompt positions)
         self.assertEqual(
             set(BYPASS_CACHE_SIDES),
             {
@@ -154,6 +156,7 @@ class TestTextSideRegistry(unittest.TestCase):
                 "cross-attention",
                 "visual-lora",
                 "falcon-visual",
+                "molmo-point",
             },
         )
         # every guarded feature's consumers are real capabilities
@@ -535,8 +538,9 @@ class TestConfigDiscovery(unittest.TestCase):
                 {"model_type": "qwen3_omni_moe", "thinker_config": {"vision_config": {}}}
             )
         )
-        # molmo v1 flat configs have no vision_config — vision genuinely unusable
-        self.assertIsNone(self.encoder_for({"model_type": "molmo", "hidden_size": 3584}))
+        # molmo v1: flat config, no vision_config — still a vision checkpoint
+        # (mlx-vlm conversions carry vision_tower.* weights; config defaults apply)
+        self.assertIsNotNone(self.encoder_for({"model_type": "molmo", "hidden_size": 3584}))
         # text-only checkpoints
         self.assertIsNone(self.encoder_for({"model_type": "llama"}))
 
