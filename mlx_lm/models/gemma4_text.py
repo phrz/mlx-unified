@@ -46,6 +46,9 @@ class ModelArgs(BaseModelArgs):
     moe_intermediate_size: Optional[int] = None
     layer_types: Optional[List[str]] = None
     tie_word_embeddings: bool = True
+    # mlx-unified: "vision" on gemma4_unified checkpoints — image-token spans attend
+    # bidirectionally within their block during prefill (see _make_masks).
+    use_bidirectional_attention: Optional[str] = None
 
     def __post_init__(self):
         if self.rope_parameters is None:
@@ -441,6 +444,19 @@ class Gemma4TextModel(nn.Module):
             for j in range(M, N):
                 self.previous_kvs[j] = kvs_by_type[self.layers[j].layer_type]
 
+        # Multimodal side state (mlx-unified), set by the vision path before generation
+        # and cleared afterwards. Underscore attrs — never registered as parameters.
+        self._mm_token_type_ids = None  # (1, L): 0 text, 1 image, 2 video, 3 audio
+        self._mm_per_layer_inputs = None  # unprojected per-layer table lookups
+
+    def set_visual_state(self, mm_token_type_ids=None, per_layer_inputs=None) -> None:
+        self._mm_token_type_ids = mm_token_type_ids
+        self._mm_per_layer_inputs = per_layer_inputs
+
+    def reset_visual_state(self) -> None:
+        self._mm_token_type_ids = None
+        self._mm_per_layer_inputs = None
+
     def _get_per_layer_inputs(
         self,
         input_ids: Optional[mx.array],
@@ -500,16 +516,65 @@ class Gemma4TextModel(nn.Module):
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
+    def _block_sequence_ids(self, mm_token_type_ids: mx.array) -> mx.array:
+        """Per-position visual-block ids: -1 for text/audio, 0..n for each contiguous
+        image/video run. Ported from mlx-vlm's gemma4 language model."""
+        types = mm_token_type_ids[0]
+        is_visual = (types == 1) | (types == 2)
+        starts = is_visual & ~mx.concatenate([mx.array([False]), is_visual[:-1]])
+        block_index = mx.cumsum(starts.astype(mx.int32)) - 1
+        return mx.where(is_visual, block_index, -1)
+
+    def _apply_bidirectional_overlay(self, base_mask, mm_token_type_ids: mx.array):
+        """OR same-visual-block bidirectional edges onto a boolean attention mask.
+
+        Handles non-square masks (cached prefix: query rows are the LAST rows;
+        windowed keys: token types truncated to the last key_len) — adapted from
+        lmstudio-ai/mlx-engine's gemma4 patch (MIT © LM Studio)."""
+        if base_mask is None or isinstance(base_mask, str):
+            return base_mask
+        key_len = base_mask.shape[-1]
+        if mm_token_type_ids.shape[1] < key_len:
+            return base_mask  # cached prefix without token types — leave causal
+        types = mm_token_type_ids[:, -key_len:]
+        block_ids = self._block_sequence_ids(types)
+        query_len = base_mask.shape[-2]
+        q = block_ids[-query_len:][:, None]
+        k = block_ids[None, :]
+        same_block = (q != -1) & (q == k)
+        return base_mask | same_block
+
     def _make_masks(self, h, cache):
+        # gemma4_unified vision: image spans must attend bidirectionally within their
+        # block during prefill. Only when visual tokens are present without audio
+        # (mixed prompts deliberately stay causal — mlx-vlm's own fallback), and only
+        # for multi-token forwards (decode steps take the fast causal path).
+        types = self._mm_token_type_ids
+        overlay = (
+            getattr(self.config, "use_bidirectional_attention", None) == "vision"
+            and types is not None
+            and h.shape[1] > 1
+        )
+        if overlay:
+            has_visual = bool(((types == 1) | (types == 2)).any().item())
+            has_audio = bool((types == 3).any().item())
+            overlay = has_visual and not has_audio
+
         mask = {}
         masks = []
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
                 if l.layer_type == "full_attention":
-                    mask["full_attention"] = create_attention_mask(h, c)
+                    mask["full_attention"] = create_attention_mask(
+                        h, c, return_array=overlay
+                    )
                 elif l.layer_type == "sliding_attention":
                     mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                        h, c, window_size=self.window_size, return_array=overlay
+                    )
+                if overlay:
+                    mask[l.layer_type] = self._apply_bidirectional_overlay(
+                        mask[l.layer_type], types
                     )
             masks.append(mask[l.layer_type])
         return masks
@@ -522,6 +587,7 @@ class Gemma4TextModel(nn.Module):
         per_layer_inputs: Optional[mx.array] = None,
     ):
         # Make the initial hidden state
+        embeds_provided = input_embeddings is not None
         if input_embeddings is None:
             input_embeddings = self.embed_tokens(inputs)
         h = input_embeddings
@@ -530,7 +596,16 @@ class Gemma4TextModel(nn.Module):
         # Get the extra inputs per layer if we have per layer embeddings
         if self.hidden_size_per_layer_input:
             if per_layer_inputs is None:
-                per_layer_inputs = self._get_per_layer_inputs(inputs, input_embeddings)
+                # Multimodal prefill (mlx-unified): use side-state per-layer inputs
+                # computed from the REAL token ids with image positions zeroed —
+                # the argmin recovery below would mis-recover spliced image embeds.
+                if embeds_provided and self._mm_per_layer_inputs is not None:
+                    n = input_embeddings.shape[1]
+                    per_layer_inputs = self._mm_per_layer_inputs[:, :n]
+                else:
+                    per_layer_inputs = self._get_per_layer_inputs(
+                        inputs, input_embeddings
+                    )
             per_layer_inputs = self._project_per_layer_inputs(h, per_layer_inputs)
         if per_layer_inputs is not None:
             per_layer_inputs = [

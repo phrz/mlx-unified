@@ -18,14 +18,36 @@ mlx_lm.server --model mlx-community/Qwen3.5-9B-MLX-4bit --port 8080
 # then POST /v1/chat/completions with {"type":"image_url", ...} content parts
 ```
 
-Supported vision architectures: `qwen3_5`, `qwen3_5_moe` (grown per-arch, like
-mlx-engine — contributions welcome). Text-only checkpoints and requests behave
-byte-identically to upstream mlx-lm; without the `[vision]` extra this IS
-upstream mlx-lm plus dormant hooks. The diff over upstream is deliberately
-small and additive to keep rebasing cheap: `mlx_lm/multimodal.py` (new),
-vision hooks in `mlx_lm/server.py`, and an MRoPE path in
-`mlx_lm/models/qwen3_5.py` (adapted from mlx-engine's qwen3_5 patch, MIT
-© LM Studio, here as first-class code instead of a monkeypatch).
+Embedding production is fully generic: the bridge calls mlx-vlm's own per-arch
+`get_input_embeddings()` (lazily loaded — the duplicate language model inside
+the mlx-vlm object never materializes), so any mlx-vlm-supported architecture
+produces merged embeddings with no new code here. What remains per-arch is
+only the TEXT side, where an architecture changes the language model's forward
+semantics for vision:
+
+| model_type | text-side need | status |
+|---|---|---|
+| `qwen3_5`, `qwen3_5_moe` | 3D multimodal RoPE | ✅ implemented |
+| `gemma4` (E2B/E4B) | explicit per-layer inputs, embed-scale fix | ✅ implemented |
+| `gemma4_unified` (12B/26B/31B, encoder-free) | bidirectional image-span masks, single-call prefill | ✅ implemented |
+| `unlimited_ocr` | its whole text model (DeepSeek-V2-MoE + Llama attention + ring KV cache) is absent from mlx-lm | ❌ blocked |
+| anything else mlx-vlm supports | none (plain injection) | untested, likely works |
+
+Beware **text-only conversions**: checkpoints converted with `mlx_lm.convert`
+keep `vision_config` in config.json but strip every vision tensor (e.g.
+`mlx-community/gemma-4-12B-it-OptiQ-4bit`) — the server refuses these rather
+than silently running a randomly-initialized projector. Use conversions made
+with mlx-vlm (e.g. `mlx-community/gemma-4-12B-it-qat-4bit`,
+`lmstudio-community/gemma-4-E2B-it-MLX-4bit`).
+
+Text-only checkpoints and requests behave byte-identically to upstream
+mlx-lm; without the `[vision]` extra this IS upstream mlx-lm plus dormant
+hooks. The diff over upstream is deliberately small and additive to keep
+rebasing cheap: `mlx_lm/multimodal.py` (new), vision hooks in
+`mlx_lm/server.py`, an MRoPE path in `mlx_lm/models/qwen3_5.py` and a
+visual-mask/per-layer path in `mlx_lm/models/gemma4_text.py` (both adapted
+from lmstudio-ai/mlx-engine's patches, MIT © LM Studio, as first-class code
+instead of monkeypatches).
 
 Upstream README follows.
 

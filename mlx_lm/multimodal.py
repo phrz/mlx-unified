@@ -2,21 +2,33 @@
 #
 # mlx-unified: vision support for mlx_lm.server.
 #
-# The approach follows lmstudio-ai/mlx-engine (MIT): the TEXT model is always
-# mlx-lm's own (this package), and mlx-vlm contributes only its vision
-# components — the vision tower encodes images into embeddings that are spliced
-# into the text-token embeddings at image-placeholder positions, then injected
-# into generation via mlx-lm's `input_embeddings` parameter. One text
-# implementation, no duplicated code paths.
+# The approach follows lmstudio-ai/mlx-engine (MIT): the TEXT model that generates is
+# always mlx-lm's own (this package); mlx-vlm contributes the vision side. Rather than
+# hand-wiring each architecture's tower/processor/merge, we call out to mlx-vlm's own
+# per-arch `Model.get_input_embeddings()` — the standardized entry point every mlx-vlm
+# model implements (processor → vision tower → feature splice → position computation) —
+# and inject its `inputs_embeds` into generation via mlx-lm's `input_embeddings`
+# parameter. New architectures work without new embedding code here.
+#
+# What remains irreducibly per-arch is the TEXT side: some architectures change the
+# language model's forward semantics for vision (qwen-family: 3D multimodal RoPE;
+# gemma4-family: bidirectional attention within image spans). Those need first-class
+# support in the corresponding mlx_lm/models/<arch>.py — TEXT_SIDE below records what
+# each arch needs and what this fork has implemented. Architectures whose text forward
+# is unchanged by vision work with plain injection automatically.
+#
+# The mlx-vlm checkpoint is loaded LAZILY (mlx arrays stay unmaterialized until used),
+# so only the vision components + embedding table actually occupy memory — the
+# duplicate language-model weights inside the mlx-vlm object are never evaluated.
 #
 # build_qwen_image_mrope_state is adapted from mlx-engine's
-# model_kit/batched_vision/qwen_mrope.py (MIT © LM Studio).
+# model_kit/batched_vision/qwen_mrope.py (MIT © LM Studio) — mlx-vlm's own position
+# computation can mis-position later image runs in multi-image prompts.
 #
 # mlx-vlm is imported lazily — text-only use of mlx_lm never requires it.
 
 import base64
 import binascii
-import glob
 import io
 import json
 from dataclasses import dataclass
@@ -25,18 +37,28 @@ from typing import List, Optional
 
 import mlx.core as mx
 
-# model_type → encoder class; growing this list is how new architectures gain
-# vision support (each needs its arch's merge/position conventions verified).
-SUPPORTED_VISION_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe")
+# What the TEXT model must support beyond plain embedding injection, per model_type.
+#   "plain" — no text-side changes needed; injection just works.
+#   "mrope" — 3D multimodal RoPE (implemented for qwen3_5/qwen3_5_moe in this fork:
+#             set_mrope_state/reset_mrope_state on the text model).
+#   "gemma-visual" — gemma4 family (implemented in this fork's gemma4_text):
+#             mm_token_type_ids-driven bidirectional attention within image spans
+#             (gemma4_unified), explicit per-layer inputs (E2B/E4B), an embed-scale
+#             correction, and single-call prefill so an image span is never split.
+TEXT_SIDE = {
+    "qwen3_5": "mrope",
+    "qwen3_5_moe": "mrope",
+    "gemma4": "gemma-visual",
+    "gemma4_unified": "gemma-visual",
+}
+
+# model_types whose qwen-style mrope positions we build ourselves (multi-image-correct)
+# instead of trusting mlx-vlm's get_rope_index output.
+QWEN_MROPE_TYPES = ("qwen3_5", "qwen3_5_moe")
 
 
 def load_vision_encoder(model_path):
-    """A VisionEncoder for the checkpoint at model_path, or None.
-
-    None when the checkpoint has no vision_config (text-only), or its
-    model_type's vision conventions aren't implemented yet — the server then
-    behaves exactly like stock mlx-lm (images rejected).
-    """
+    """A vision bridge for the checkpoint at model_path, or None for text-only ones."""
     model_path = Path(model_path)
     try:
         with open(model_path / "config.json") as f:
@@ -45,9 +67,7 @@ def load_vision_encoder(model_path):
         return None
     if "vision_config" not in config:
         return None
-    if config.get("model_type") not in SUPPORTED_VISION_MODEL_TYPES:
-        return None
-    return QwenVisionEncoder(model_path, config)
+    return MlxVlmBridge(model_path, config)
 
 
 def images_from_message_content(content) -> List[str]:
@@ -87,51 +107,72 @@ class VisionPrompt:
 
     tokens: List[int]  # image placeholders expanded to their per-patch runs
     embeddings: mx.array  # (L, hidden) merged text+image embeddings
-    position_ids: mx.array  # (3, 1, L) multimodal rope positions
-    rope_deltas: mx.array  # (1, 1)
+    position_ids: Optional[mx.array] = None  # (3, 1, L) multimodal rope (qwen family)
+    rope_deltas: Optional[mx.array] = None  # (1, 1)
+    # gemma4 family:
+    mm_token_type_ids: Optional[mx.array] = None  # (1, L): 0 text / 1 image / 2 video / 3 audio
+    per_layer_token_ids: Optional[List[int]] = None  # ids with image positions zeroed (E2B/E4B)
+    single_prefill: bool = False  # image span must sit in ONE prefill forward
 
 
-class QwenVisionEncoder:
-    """Vision components for the qwen3_5 family, loaded from the same checkpoint
-    the text model came from. Heavy pieces (processor, vision tower) load lazily
-    on the first image request."""
+class MlxVlmBridge:
+    """Generic vision bridge: lazily loads the checkpoint through mlx-vlm and calls its
+    per-arch get_input_embeddings. Heavy pieces load on the first image request."""
 
     def __init__(self, model_path: Path, config: dict):
         self.model_path = model_path
         self.config = config
-        self.image_token_id = config["image_token_id"]
-        self.video_token_id = config.get("video_token_id")
-        self.spatial_merge_size = config["vision_config"]["spatial_merge_size"]
+        self.model_type = config.get("model_type", "")
+        self.image_token_id = (
+            config.get("image_token_id")
+            or config.get("image_token_index")
+            or (config.get("vision_config") or {}).get("image_token_id")
+        )
+        self._vlm = None
         self._processor = None
-        self._tower = None
 
     def _ensure_loaded(self):
-        if self._tower is not None:
+        if self._vlm is not None:
             return
-        from mlx_vlm.models.qwen3_5 import VisionModel
-        from mlx_vlm.models.qwen3_5.config import VisionConfig
-        from mlx_vlm.utils import load_processor
+        from mlx_vlm.utils import load_model, load_processor
 
+        # Refuse conversions whose vision weights were stripped (an mlx-lm-made
+        # conversion keeps vision_config in config.json but drops every non-language
+        # tensor). Running those would silently use RANDOMLY-initialized vision
+        # projections — plausible-looking garbage, the worst failure mode.
+        import glob as _glob
+
+        has_vision_weights = False
+        index = self.model_path / "model.safetensors.index.json"
+        if index.exists():
+            with open(index) as f:
+                keys = json.load(f).get("weight_map", {}).keys()
+            has_vision_weights = any(not k.startswith("language_model.") for k in keys)
+        else:
+            for shard in _glob.glob(str(self.model_path / "model*.safetensors")):
+                if any(not k.startswith("language_model.") for k in mx.load(shard)):
+                    has_vision_weights = True
+                    break
+        if not has_vision_weights:
+            raise ValueError(
+                "this checkpoint's config declares vision_config but its weights are "
+                "text-only (an mlx-lm conversion strips vision tensors) — use a "
+                "conversion made with mlx-vlm"
+            )
+
+        # lazy=True: arrays materialize only when evaluated — the duplicate language
+        # model inside the mlx-vlm object never runs, so it never occupies memory.
+        # strict=False: some conversions carry vestigial text-side weights that
+        # mlx-vlm's language classes don't instantiate (e.g. per-layer K/V for
+        # gemma-4's KV-shared layers) — harmless here, we only use the vision side.
+        self._vlm = load_model(self.model_path, lazy=True, strict=False)
         self._processor = load_processor(self.model_path)
-        tower = VisionModel(VisionConfig.from_dict(self.config["vision_config"]))
-        weights = {}
-        for shard in glob.glob(str(self.model_path / "model*.safetensors")):
-            for k, v in mx.load(shard).items():
-                if k.startswith("vision_tower."):
-                    weights[k.removeprefix("vision_tower.")] = v
-        if not weights:
-            raise ValueError(f"no vision_tower.* weights in {self.model_path}")
-        tower.load_weights(list(weights.items()), strict=True)
-        tower.eval()
-        self._tower = tower
 
-    def prepare(self, rendered_prompt: str, images: List[str], embed_tokens) -> VisionPrompt:
-        """(chat-template-rendered prompt text, image payloads) → VisionPrompt.
-
-        `embed_tokens` is the TEXT model's embedding module — the text side of
-        the merged embedding always comes from mlx-lm's own weights.
-        """
+    def prepare(self, rendered_prompt: str, images: List[str]) -> VisionPrompt:
+        """(chat-template-rendered prompt text, image payloads) → VisionPrompt."""
         from mlx_vlm.utils import prepare_inputs
+
+        side = TEXT_SIDE.get(self.model_type, "plain")
 
         self._ensure_loaded()
         pils = [decode_image(i) for i in images]
@@ -141,43 +182,95 @@ class QwenVisionEncoder:
             prompts=rendered_prompt,
             image_token_index=self.image_token_id,
         )
-        input_ids = inputs["input_ids"]  # (1, L), placeholders expanded per patch
-        pixel_values = inputs["pixel_values"]
-        grid_thw = inputs["image_grid_thw"]
-
-        text_embeds = embed_tokens(input_ids)
-        image_embeds, _ = self._tower(
-            pixel_values.astype(self._tower.patch_embed.proj.weight.dtype), grid_thw
+        input_ids = inputs["input_ids"]  # (1, L), placeholders expanded
+        extra = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ("input_ids", "pixel_values", "attention_mask")
+        }
+        feats = self._vlm.get_input_embeddings(
+            input_ids,
+            inputs.get("pixel_values"),
+            mask=inputs.get("attention_mask"),
+            **extra,
         )
-        merged = self._merge(text_embeds, input_ids, image_embeds.astype(text_embeds.dtype))
+        # Normalize: some archs return a bare array instead of the dataclass.
+        if isinstance(feats, mx.array):
+            embeds = feats
+            position_ids = rope_deltas = None
+        else:
+            embeds = feats.inputs_embeds
+            position_ids = feats.position_ids
+            rope_deltas = feats.rope_deltas
+            for field, why in (
+                ("attention_mask_4d", "bidirectional attention masks"),
+                ("deepstack_visual_embeds", "mid-layer visual injection"),
+                ("cross_attention_states", "cross-attention"),
+            ):
+                if getattr(feats, field, None) is not None:
+                    raise ValueError(
+                        f'architecture "{self.model_type}" produces {why} — not yet '
+                        "supported by mlx-unified's injection path"
+                    )
+            if getattr(feats, "per_layer_inputs", None) is not None and side != "gemma-visual":
+                raise ValueError(
+                    f'architecture "{self.model_type}" produces per-layer multimodal '
+                    "inputs — not yet supported by mlx-unified's injection path"
+                )
 
-        state = build_qwen_image_mrope_state(
-            input_ids=input_ids,
-            image_grid_thw=grid_thw,
-            image_token_id=self.image_token_id,
-            spatial_merge_size=self.spatial_merge_size,
-        )
+        mm_token_type_ids = None
+        per_layer_token_ids = None
+        single_prefill = False
+
+        if self.model_type in QWEN_MROPE_TYPES:
+            # Multi-image-correct positions (mlx-vlm's own can drift on later runs).
+            state = build_qwen_image_mrope_state(
+                input_ids=input_ids,
+                image_grid_thw=inputs["image_grid_thw"],
+                image_token_id=self.image_token_id,
+                spatial_merge_size=self.config["vision_config"]["spatial_merge_size"],
+            )
+            position_ids, rope_deltas = state.position_ids, state.rope_deltas
+
+        if side == "gemma-visual":
+            # 1) mlx-vlm returns embeddings ALREADY ×sqrt(hidden); mlx-lm's gemma4_text
+            #    scales injected embeddings again — undo one scaling here.
+            text_hidden = (self.config.get("text_config") or {}).get(
+                "hidden_size"
+            ) or self.config.get("hidden_size")
+            embeds = embeds / (text_hidden**0.5)
+            # 2) token types drive the bidirectional image-span mask (gemma4_unified);
+            #    derive from ids if the processor didn't emit them.
+            mm_token_type_ids = inputs.get("mm_token_type_ids")
+            if mm_token_type_ids is None:
+                mm_token_type_ids = (input_ids == self.image_token_id).astype(mx.int32)
+            # 3) E2B/E4B per-layer inputs must come from the REAL ids with image
+            #    positions zeroed (computed against the serving model's own weights).
+            if ((self.config.get("text_config") or {}).get("hidden_size_per_layer_input") or 0) > 0:
+                zeroed = mx.where(
+                    input_ids == self.image_token_id, mx.zeros_like(input_ids), input_ids
+                )
+                per_layer_token_ids = zeroed.squeeze(0).tolist()
+            # 4) an image span must never be split across prefill chunks — the
+            #    bidirectional edges within a block are unrecoverable once the first
+            #    chunk's KV is written causally.
+            single_prefill = True
+
+        if position_ids is not None and side != "mrope":
+            raise ValueError(
+                f'architecture "{self.model_type}" requires multimodal position support '
+                "that its mlx-lm text model does not implement yet"
+            )
+
         return VisionPrompt(
             tokens=input_ids.squeeze(0).tolist(),
-            embeddings=merged.squeeze(0),
-            position_ids=state.position_ids,
-            rope_deltas=state.rope_deltas,
+            embeddings=embeds.squeeze(0) if embeds.ndim == 3 else embeds,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+            mm_token_type_ids=mm_token_type_ids,
+            per_layer_token_ids=per_layer_token_ids,
+            single_prefill=single_prefill,
         )
-
-    def _merge(self, text_embeds: mx.array, input_ids: mx.array, image_embeds: mx.array):
-        from mlx_vlm.models.qwen3_vl.qwen3_vl import masked_scatter
-
-        mask = input_ids == self.image_token_id
-        if self.video_token_id is not None:
-            mask = mask | (input_ids == self.video_token_id)
-        mask = mx.broadcast_to(mask[..., None], text_embeds.shape)
-        n_slots = int(mask.sum().item()) // text_embeds.shape[-1]
-        if n_slots != image_embeds.shape[0]:
-            raise ValueError(
-                f"image feature count ({image_embeds.shape[0]}) does not match "
-                f"placeholder token count ({n_slots})"
-            )
-        return masked_scatter(text_embeds, mask, image_embeds)
 
 
 # --- Qwen multimodal-RoPE position builder --------------------------------

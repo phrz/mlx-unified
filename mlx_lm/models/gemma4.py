@@ -86,6 +86,12 @@ class Model(nn.Module):
         return self.language_model.layers
 
     @property
+    def model(self):
+        # Uniform access to the inner text model (multimodal side state lives there) —
+        # the same shape as qwen3_5's Model.model property.
+        return self.language_model.model
+
+    @property
     def quant_predicate(self):
         return self.language_model.quant_predicate
 

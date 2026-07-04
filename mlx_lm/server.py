@@ -606,9 +606,7 @@ class ResponseGenerator:
                         add_generation_prompt=True,
                         **{**template_kwargs, "tokenize": False},
                     )
-                    request.vision = encoder.prepare(
-                        rendered, images, self.model_provider.model.model.embed_tokens
-                    )
+                    request.vision = encoder.prepare(rendered, images)
                     prompt = request.vision.tokens
                     initial_state = "normal"
                     if tokenizer.has_thinking:
@@ -1044,7 +1042,21 @@ class ResponseGenerator:
                 cache = make_prompt_cache(self.model_provider.model)
                 cache_key = None
                 generate_kwargs["input_embeddings"] = vision.embeddings
-                model.model.set_mrope_state(vision.position_ids, vision.rope_deltas)
+                if vision.position_ids is not None:
+                    # qwen-family: 3D multimodal rope side state (see models/qwen3_5.py)
+                    model.model.set_mrope_state(vision.position_ids, vision.rope_deltas)
+                if vision.mm_token_type_ids is not None or vision.per_layer_token_ids:
+                    # gemma4 family: bidirectional image-span masks + explicit
+                    # per-layer inputs (see models/gemma4_text.py)
+                    per_layer = None
+                    if vision.per_layer_token_ids:
+                        per_layer = model.model._get_per_layer_inputs(
+                            mx.array(vision.per_layer_token_ids)[None]
+                        )
+                    model.model.set_visual_state(
+                        mm_token_type_ids=vision.mm_token_type_ids,
+                        per_layer_inputs=per_layer,
+                    )
             else:
                 # Load the KV cache
                 self._log_cache_stats()
@@ -1058,6 +1070,12 @@ class ResponseGenerator:
                     if self.model_provider.draft_model is not None:
                         cache += make_prompt_cache(self.model_provider.draft_model)
 
+            # An image span must never be split across prefill chunks (gemma4
+            # bidirectional masks are built per forward) — widen to one call.
+            prefill_step_size = self.cli_args.prefill_step_size
+            if vision is not None and vision.single_prefill:
+                prefill_step_size = max(len(prompt), prefill_step_size)
+
             # Process the prompt and generate tokens
             for gen in stream_generate(
                 model=model,
@@ -1070,7 +1088,7 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
-                prefill_step_size=self.cli_args.prefill_step_size,
+                prefill_step_size=prefill_step_size,
                 **generate_kwargs,
             ):
                 finish_reason = gen.finish_reason
@@ -1113,7 +1131,11 @@ class ResponseGenerator:
             rqueue.put(e)
         finally:
             if getattr(request, "vision", None) is not None:
-                self.model_provider.model.model.reset_mrope_state()
+                inner = self.model_provider.model.model
+                if hasattr(inner, "reset_mrope_state"):
+                    inner.reset_mrope_state()
+                if hasattr(inner, "reset_visual_state"):
+                    inner.reset_visual_state()
 
     def generate(
         self,
