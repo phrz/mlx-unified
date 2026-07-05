@@ -379,11 +379,13 @@ class DecoderModel(nn.Module):
         else:
             probs = mx.softmax(self_conditioning_logits, axis=-1, precise=True)
             if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
+                # mxfp4-quantized embeddings have no biases attribute at all — a
+                # direct access would raise before quantized_matmul even runs.
                 soft_embeddings = mx.quantized_matmul(
                     probs.astype(inputs_embeds.dtype),
                     self.embed_tokens.weight,
                     self.embed_tokens.scales,
-                    self.embed_tokens.biases,
+                    getattr(self.embed_tokens, "biases", None),
                     transpose=False,
                     group_size=self.embed_tokens.group_size,
                     bits=self.embed_tokens.bits,
