@@ -48,10 +48,18 @@ setup(
         "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],
         "cuda12": [f"mlx[cuda12]>={MIN_MLX_VERSION}"],
         "cpu": [f"mlx[cpu]>={MIN_MLX_VERSION}"],
-        # mlx-unified: vision components (tower + processors) come from mlx-vlm.
-        # transformers upper bound: 5.13.0 broke AutoTokenizer.register in a way
-        # mlx-lm's tokenizer_utils doesn't handle yet.
-        "vision": ["mlx-vlm>=0.6.0", "Pillow", "transformers>=5.7.0,<5.13.0"],
+        # mlx-unified: vision components (tower + processors) AND the serving
+        # engine for delegated families (vlm_delegate) come from OUR mlx-vlm
+        # fork — the draft-blocks branch carries the x_stream_draft_blocks
+        # extension the server forwards, so mlx-unified owns which mlx-vlm it
+        # delegates to. transformers upper bound: 5.13.0 broke
+        # AutoTokenizer.register in a way mlx-lm's tokenizer_utils doesn't
+        # handle yet.
+        "vision": [
+            "mlx-vlm @ git+https://github.com/phrz/mlx-vlm@draft-blocks",
+            "Pillow",
+            "transformers>=5.7.0,<5.13.0",
+        ],
     },
     entry_points={
         "console_scripts": [
