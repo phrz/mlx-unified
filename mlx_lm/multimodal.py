@@ -33,6 +33,8 @@ import hashlib
 import io
 import json
 import re
+from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Union
@@ -324,6 +326,50 @@ class VisionPrompt:
         )
 
 
+# Vision-tower attribute names across mlx-vlm archs (by frequency); the memo
+# proxy below wraps whichever of these the loaded model actually has.
+_TOWER_ATTRS = ("vision_tower", "vision_model", "visual", "vision_encoder")
+
+# Distinct image sets whose tower outputs stay memoized (LRU). Tower features
+# are a few–tens of MB per image set; the memo dies with the bridge on unload.
+_TOWER_MEMO_MAX = 8
+
+
+class _TowerMemoProxy:
+    """Memoizes vision-tower forward passes by image fingerprint.
+
+    Installed into the owning module's instance __dict__ only for the duration
+    of one prepare() call (instance attributes shadow mlx nn.Module's dict
+    storage without touching the parameter tree). Repeat images skip the ViT
+    entirely; anything else (sub-module access, weight dtype reads) delegates
+    to the real tower.
+    """
+
+    def __init__(self, tower, memo: OrderedDict, fingerprint: str, name: str):
+        self._tower = tower
+        self._memo = memo
+        self._key_base = (fingerprint, name)
+        self._calls = 0
+
+    def __call__(self, *args, **kwargs):
+        # Call index keeps multiple tower passes per prompt distinct; the call
+        # sequence is deterministic for a given (arch, image set).
+        key = (*self._key_base, self._calls)
+        self._calls += 1
+        if key in self._memo:
+            self._memo.move_to_end(key)
+            return self._memo[key]
+        out = self._tower(*args, **kwargs)
+        mx.eval(out)  # detach from this request's lazy graph before storing
+        self._memo[key] = out
+        while len(self._memo) > _TOWER_MEMO_MAX:
+            self._memo.popitem(last=False)
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._tower, name)
+
+
 class MlxVlmBridge:
     """Generic vision bridge: lazily loads the checkpoint through mlx-vlm and calls its
     per-arch get_input_embeddings. Heavy pieces load on the first image request."""
@@ -348,6 +394,8 @@ class MlxVlmBridge:
         )
         self._vlm = None
         self._processor = None
+        # fingerprint-keyed vision-tower outputs (see _TowerMemoProxy)
+        self._tower_memo: OrderedDict = OrderedDict()
 
     def _ensure_loaded(self):
         if self._vlm is not None:
@@ -398,6 +446,31 @@ class MlxVlmBridge:
         self._vlm = load_model(self.model_path, lazy=True, strict=False)
         self._processor = load_processor(self.model_path)
 
+    @contextmanager
+    def _memoized_towers(self, fingerprint: str):
+        """Shadow every vision-tower attribute on the vlm (and its thinker, for
+        omni) with a memoizing proxy for the duration of one prepare()."""
+        installed = []
+        if fingerprint:
+            owners = [self._vlm]
+            thinker = getattr(self._vlm, "thinker", None)
+            if thinker is not None:
+                owners.append(thinker)
+            for owner in owners:
+                for name in _TOWER_ATTRS:
+                    tower = getattr(owner, name, None)
+                    if tower is None or isinstance(tower, _TowerMemoProxy):
+                        continue
+                    owner.__dict__[name] = _TowerMemoProxy(
+                        tower, self._tower_memo, fingerprint, name
+                    )
+                    installed.append((owner, name))
+        try:
+            yield
+        finally:
+            for owner, name in installed:
+                owner.__dict__.pop(name, None)
+
     def _qwen3_omni_tower_features(self, pixel_values, image_grid_thw):
         """One qwen3_omni_moe vision-tower pass, the thinker's way (same dtype
         cast): returns (embeds, multiscale) — multiscale is the per-deepstack-layer
@@ -441,21 +514,23 @@ class MlxVlmBridge:
         # features hook for its video branch, and pre-empting only the image
         # tower would break the image/video multiscale join.
         omni_multiscale = None
-        if (
-            self.model_type == "qwen3_omni_moe"
-            and inputs.get("pixel_values") is not None
-            and inputs.get("pixel_values_videos") is None
-        ):
-            cached, omni_multiscale = self._qwen3_omni_tower_features(
-                inputs["pixel_values"], inputs.get("image_grid_thw")
+        fingerprint = image_fingerprint(images)
+        with self._memoized_towers(fingerprint):
+            if (
+                self.model_type == "qwen3_omni_moe"
+                and inputs.get("pixel_values") is not None
+                and inputs.get("pixel_values_videos") is None
+            ):
+                cached, omni_multiscale = self._qwen3_omni_tower_features(
+                    inputs["pixel_values"], inputs.get("image_grid_thw")
+                )
+                extra["cached_image_features"] = cached
+            feats = self._vlm.get_input_embeddings(
+                input_ids,
+                inputs.get("pixel_values"),
+                mask=inputs.get("attention_mask"),
+                **extra,
             )
-            extra["cached_image_features"] = cached
-        feats = self._vlm.get_input_embeddings(
-            input_ids,
-            inputs.get("pixel_values"),
-            mask=inputs.get("attention_mask"),
-            **extra,
-        )
         # Normalize: some archs return a bare array instead of the dataclass.
         if isinstance(feats, mx.array):
             embeds = feats
@@ -689,7 +764,7 @@ class MlxVlmBridge:
             pointing_metadata=pointing_metadata,
             single_prefill=single_prefill,
             bypass_cache=side in BYPASS_CACHE_SIDES,
-            image_fingerprint=image_fingerprint(images),
+            image_fingerprint=fingerprint,
         )
 
 

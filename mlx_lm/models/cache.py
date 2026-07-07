@@ -1,6 +1,5 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import copy
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -1656,9 +1655,15 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self, max_size: int = 10, max_bytes: int = 1 << 63, disk_store: Any = None
+    ):
+        # mlx-unified: max_size <= 0 means "no entry limit" — only the byte
+        # budget governs eviction. disk_store (see disk_prompt_cache.py) spills
+        # evicted entries to safetensors instead of dropping them.
         self.max_size = max_size
         self.max_bytes = max_bytes
+        self._disk_store = disk_store
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
@@ -1672,26 +1677,59 @@ class LRUPromptCache:
         return self._n_bytes
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
+        # mlx-unified: MOVE semantics — a hit pops the entry and returns the
+        # cache itself (no deepcopy of multi-GB KV on the request path). The
+        # server re-inserts the extended cache after generation, so the serial
+        # follow-up case round-trips with zero copies. A concurrent request on
+        # the same prefix simply misses and recomputes (mlx-engine's hot-entry
+        # take-ownership tradeoff).
+        plan = self._plan_fetch(model, tokens)
+        ram_prefix = plan[1] if plan is not None else 0
+
+        # The disk tier only loads when it can serve a strictly longer prefix
+        # than RAM; ties stay in RAM (no I/O). Plan before popping so a disk
+        # win never orphans a RAM entry.
+        if self._disk_store is not None and ram_prefix < len(tokens):
+            disk_plan = self._disk_store.plan(model, tokens)
+            if disk_plan is not None and disk_plan.prefix_len > ram_prefix:
+                cache = self._disk_store.load(model, disk_plan)
+                if cache is not None:
+                    if disk_plan.trim:
+                        trim_prompt_cache(cache, disk_plan.trim)
+                    return cache, tokens[disk_plan.prefix_len :]
+
+        if plan is None:
+            return None, tokens
+        key_tokens, prefix, num_to_trim = plan
+        entry = self._pop_entry(model, key_tokens)
+        if num_to_trim:
+            trim_prompt_cache(entry.prompt_cache, num_to_trim)
+        return entry.prompt_cache, tokens[prefix:]
+
+    def _plan_fetch(self, model: Any, tokens: List[int]):
+        """Pick the best RAM entry without popping: (key_tokens, prefix, trim)."""
         result = self._trie.search(model, tokens)
         if result.exact is not None:
-            cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            return result.exact, len(result.exact), 0
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                return result.longer, prefix, len(result.longer) - prefix
 
         if short_length > 0:
-            cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            return result.shorter, short_length, 0
 
-        return None, tokens
+        return None
+
+    def _pop_entry(self, model: Any, tokens: List[int]):
+        entry = self._trie.pop(model, tokens)
+        self._lru.remove(model, tokens)
+        self._n_bytes -= entry.nbytes
+        self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        return entry
 
     def insert_cache(
         self,
@@ -1724,17 +1762,11 @@ class LRUPromptCache:
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._lru.remove(model, tokens[:prefix_len])
 
-        # Ensure we match the constraints
-        if len(self._lru) > self.max_size:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-        while self._n_bytes > self.max_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        # Ensure we match the constraints (max_size <= 0 → bytes-only)
+        if self.max_size > 0 and len(self._lru) > self.max_size:
+            self._evict_one()
+        while self._n_bytes > self.max_bytes and len(self._lru) > 0:
+            self._evict_one()
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -1743,15 +1775,20 @@ class LRUPromptCache:
         n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
 
         while len(self._lru) > n_sequences:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
-        while self._n_bytes > n_bytes:
-            model, tokens = self._lru.pop()
-            entry = self._trie.pop(model, tokens)
-            self._n_bytes -= entry.nbytes
-            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            self._evict_one()
+        while self._n_bytes > n_bytes and len(self._lru) > 0:
+            self._evict_one()
+
+    def _evict_one(self):
+        """Evict the LRU entry, spilling it to the disk tier when one is set."""
+        model, tokens = self._lru.pop()
+        entry = self._trie.pop(model, tokens)
+        self._n_bytes -= entry.nbytes
+        self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+        if self._disk_store is not None:
+            self._disk_store.offer(
+                model, tokens, entry.prompt_cache, entry.nbytes, entry.cache_type
+            )
 
     def stats_by_type(self):
         result = {}

@@ -518,6 +518,10 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    # mlx-unified: fetch_nearest_cache has MOVE semantics — a hit pops the
+    # entry and hands back the cache itself (no deepcopy on the request path);
+    # the server re-inserts the extended cache after generation.
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 
@@ -534,39 +538,37 @@ class TestLRUPromptCache(unittest.TestCase):
 
         c = [KVCache()]
         c[0].update_and_fetch(*get_kv(24))
+        original = c[0]
         cache.insert_cache(model, t, c)
 
-        # Fetching a cache that is strictly a prefix doesn't remove it from the
-        # lru cache
+        # A prefix hit moves the entry out: the SAME cache object comes back
+        # (no copy) and the entry leaves the LRU until re-inserted.
         tokens = tokens + [20] * 5
         c, t = cache.fetch_nearest_cache(model, tokens)
+        self.assertIs(c[0], original)
         k, v = c[0].state
         self.assertTrue((k == v).all().item())
         self.assertTrue((k.flatten() == mx.arange(24)).all().item())
         self.assertEqual(t, [20] * 5)
-        self.assertEqual(len(cache), 1)
+        self.assertEqual(len(cache), 0)
 
-        # Inserting a trimmable cache with shared prefix removes the prefixes
+        # Server flow: generation extends the cache, then re-inserts it.
         tokens = tokens + [30] * 3
         c[0].update_and_fetch(*get_kv(8))
         cache.insert_cache(model, tokens, c)
         self.assertEqual(len(cache), 1)
 
-        # Fetching a cache with a shared prefix doesn't remove it either
+        # A diverging prompt trims the (trimmable) longer entry in place.
         tokens = tokens[:26] + [40] * 8
         c, t = cache.fetch_nearest_cache(model, tokens)
+        self.assertIs(c[0], original)
         k, v = c[0].state
         self.assertTrue((k == v).all().item())
         self.assertTrue(
             (k.flatten() == mx.concatenate([mx.arange(24), mx.arange(2)])).all().item()
         )
         self.assertEqual(t, [40] * 8)
-        self.assertEqual(len(cache), 1)
-
-        # Inserting a diverged cache actually creates another entry
-        c[0].update_and_fetch(*get_kv(8))
-        cache.insert_cache(model, tokens, c)
-        self.assertEqual(len(cache), 2)
+        self.assertEqual(len(cache), 0)
 
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
@@ -574,58 +576,102 @@ class TestLRUPromptCache(unittest.TestCase):
         cache.insert_cache(model, [1, 2], [MockCache("test1")])
         cache.insert_cache(model, [2, 3], [MockCache("test2")])
 
+        # A hit pops the entry…
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, [MockCache("test1")])
         self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [1])
-        self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [1])
-        c, t = cache.fetch_nearest_cache(model, [1, 3, 4])
-        self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [3, 4])
+        self.assertEqual(len(cache), 1)
+        # …so an immediate identical fetch misses (recompute-on-race tradeoff)
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [1, 2])
+        # and the other entry is untouched until fetched.
         c, t = cache.fetch_nearest_cache(model, [2, 3, 4])
         self.assertEqual(c, [MockCache("test2")])
         self.assertEqual(t, [4])
-        c, t = cache.fetch_nearest_cache(model, [2, 4, 5])
-        self.assertEqual(c, [MockCache("test2")])
-        self.assertEqual(t, [4, 5])
+        self.assertEqual(len(cache), 0)
 
+        # Entry-count eviction still drops the oldest.
         cache.insert_cache(model, [1, 2], [MockCache("test1")])
         cache.insert_cache(model, [2, 3], [MockCache("test2")])
         cache.insert_cache(model, [3, 4], [MockCache("test3")])
-
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, None)
         self.assertEqual(t, [1, 2])
         c, t = cache.fetch_nearest_cache(model, [2, 3])
         self.assertEqual(c, [MockCache("test2")])
-        self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
 
-        cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
-        c, t = cache.fetch_nearest_cache(model, [2, 3])
-        self.assertEqual(c, None)
-        self.assertEqual(t, [2, 3])
-        c, t = cache.fetch_nearest_cache(model, [3, 4])
-        self.assertEqual(c, [MockCache("test3")])
-        self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [4, 5])
-        self.assertEqual(c, [MockCache("test4")])
-        self.assertEqual(t, [])
+    def test_bytes_only_sizing(self):
+        # max_size=0 disables the entry limit; only the byte budget governs.
+        cache = LRUPromptCache(max_size=0, max_bytes=10)
+        model = ("test", None, None)
+        for i in range(5):
+            cache.insert_cache(model, [i, i + 100], [MockCache("ab")])
+        self.assertEqual(len(cache), 5)
+        self.assertEqual(cache.nbytes, 10)
 
-        cache.insert_cache(model, [5, 6], [MockCache("test5")])
-        cache.insert_cache(model, [6, 7], [MockCache("test6")])
-        c, t = cache.fetch_nearest_cache(model, [5, 6])
+        # The 6th entry pushes bytes over budget → the oldest is evicted.
+        cache.insert_cache(model, [50, 51], [MockCache("ab")])
+        self.assertEqual(len(cache), 5)
+        self.assertEqual(cache.nbytes, 10)
+        c, t = cache.fetch_nearest_cache(model, [0, 100])
         self.assertEqual(c, None)
-        self.assertEqual(t, [5, 6])
-        c, t = cache.fetch_nearest_cache(model, [6, 7])
-        self.assertEqual(c, [MockCache("test6")])
-        self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [4, 5])
-        self.assertEqual(c, [MockCache("test4")])
-        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [50, 51])
+        self.assertEqual(c, [MockCache("ab")])
+
+
+class TestDiskPromptCache(unittest.TestCase):
+    def test_spill_and_restore(self):
+        import tempfile
+        import time
+
+        from mlx_lm.disk_prompt_cache import DiskPromptCacheStore
+
+        def kv(n):
+            c = KVCache()
+            k = mx.arange(n, dtype=mx.float32).reshape(1, 1, n, 1)
+            c.update_and_fetch(k, k)
+            return [c]
+
+        with tempfile.TemporaryDirectory() as d:
+            store = DiskPromptCacheStore(1 << 30, directory=d)
+            try:
+                cache = LRUPromptCache(max_size=1, disk_store=store)
+                model = ("m", None, None)
+
+                cache.insert_cache(model, [1] * 8, kv(8))
+                # Second insert evicts the first, which spills to disk.
+                cache.insert_cache(model, [2] * 8, kv(8))
+                deadline = time.time() + 10
+                while len(store) == 0 and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(len(store), 1)
+                self.assertGreater(store.nbytes, 0)
+
+                # RAM has nothing for this prompt; the disk tier serves the
+                # prefix and the entry moves back out of the store.
+                c, t = cache.fetch_nearest_cache(model, [1] * 8 + [3] * 2)
+                self.assertIsNotNone(c)
+                self.assertEqual(t, [3] * 2)
+                k, v = c[0].state
+                self.assertEqual(k.shape[2], 8)
+                self.assertTrue((k.flatten() == mx.arange(8)).all().item())
+                self.assertEqual(len(store), 0)
+
+                # A shorter RAM prefix loses to a longer disk prefix.
+                cache.insert_cache(model, [1] * 8 + [3] * 2, c)
+                cache.insert_cache(model, [4] * 4, kv(4))  # spills the 10-token entry
+                deadline = time.time() + 10
+                while len(store) < 2 and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertGreaterEqual(len(store), 2)
+                cache.insert_cache(model, [1] * 2 + [9] * 2, kv(4))  # RAM: prefix 2
+                c, t = cache.fetch_nearest_cache(model, [1] * 8 + [3] * 2 + [5] * 4)
+                self.assertEqual(t, [5] * 4)  # disk served all 10 cached tokens
+            finally:
+                store.close()
 
     def test_insert_trimmable_cache_removes_immediate_prefix(self):
         cache = LRUPromptCache(max_size=10)

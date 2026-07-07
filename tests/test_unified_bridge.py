@@ -575,5 +575,76 @@ class TestGemma3ModelProperty(unittest.TestCase):
         self.assertTrue(hasattr(model.model, "reset_visual_state"))
 
 
+class TestTowerMemo(unittest.TestCase):
+    """Vision-tower memoization: repeat images skip the ViT forward."""
+
+    class _Tower:
+        def __init__(self):
+            self.calls = 0
+            self.some_attr = 7
+
+        def __call__(self, x):
+            self.calls += 1
+            return mx.array([float(x)])
+
+    def test_memoizes_by_fingerprint(self):
+        from collections import OrderedDict
+
+        from mlx_lm.multimodal import _TowerMemoProxy
+
+        tower = self._Tower()
+        memo = OrderedDict()
+
+        # First request computes; a second request with the same fingerprint
+        # (a fresh proxy, as prepare() installs one per call) hits the memo.
+        out1 = _TowerMemoProxy(tower, memo, "fp1", "vision_tower")(1.0)
+        out2 = _TowerMemoProxy(tower, memo, "fp1", "vision_tower")(1.0)
+        self.assertEqual(tower.calls, 1)
+        self.assertTrue((out1 == out2).all().item())
+
+        # A different image set recomputes.
+        _TowerMemoProxy(tower, memo, "fp2", "vision_tower")(2.0)
+        self.assertEqual(tower.calls, 2)
+
+        # Multiple tower passes in one prepare() stay distinct by call index.
+        p = _TowerMemoProxy(tower, memo, "fp3", "vision_tower")
+        a, b = p(3.0), p(4.0)
+        self.assertEqual(tower.calls, 4)
+        self.assertNotEqual(a.item(), b.item())
+
+        # Sub-attribute access delegates to the real tower.
+        proxy = _TowerMemoProxy(tower, memo, "fp1", "vision_tower")
+        self.assertEqual(proxy.some_attr, 7)
+
+    def test_install_and_restore_on_module(self):
+        from collections import OrderedDict
+
+        import mlx.nn as nn
+
+        from mlx_lm.multimodal import _TowerMemoProxy
+
+        class Tower(nn.Module):
+            def __call__(self, x):
+                return x
+
+        class Vlm(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vision_tower = Tower()
+
+        bridge = MlxVlmBridge.__new__(MlxVlmBridge)
+        bridge._vlm = Vlm()
+        bridge._tower_memo = OrderedDict()
+        original = bridge._vlm.vision_tower
+
+        with bridge._memoized_towers("fp"):
+            self.assertIsInstance(bridge._vlm.vision_tower, _TowerMemoProxy)
+        self.assertIs(bridge._vlm.vision_tower, original)
+
+        # An empty fingerprint (text-only prompt) installs nothing.
+        with bridge._memoized_towers(""):
+            self.assertIs(bridge._vlm.vision_tower, original)
+
+
 if __name__ == "__main__":
     unittest.main()

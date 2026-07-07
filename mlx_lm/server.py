@@ -869,6 +869,9 @@ class ResponseGenerator:
             and not request_has_images(request)
             and getattr(self.model_provider, "delegate", None) is None
             and not is_diffusion_model(self.model_provider.model)
+            # KV cache quantization runs through generate_step's
+            # maybe_quantize_kv_cache; BatchGenerator has no equivalent hook.
+            and getattr(self.cli_args, "kv_bits", None) is None
         )
 
     def _generate(self):
@@ -1299,6 +1302,12 @@ class ResponseGenerator:
             prefill_step_size = self.cli_args.prefill_step_size
             if vision is not None and vision.single_prefill:
                 prefill_step_size = max(len(rest), prefill_step_size)
+
+            # KV cache quantization (sequential path; see _is_batchable).
+            if getattr(self.cli_args, "kv_bits", None) is not None:
+                generate_kwargs["kv_bits"] = self.cli_args.kv_bits
+                generate_kwargs["kv_group_size"] = self.cli_args.kv_group_size
+                generate_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -2278,7 +2287,18 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    disk_store = None
+    if getattr(model_provider.cli_args, "prompt_cache_disk_bytes", None):
+        from .disk_prompt_cache import DiskPromptCacheStore
+
+        disk_store = DiskPromptCacheStore(
+            model_provider.cli_args.prompt_cache_disk_bytes
+        )
+    prompt_cache = LRUPromptCache(
+        max_size=model_provider.cli_args.prompt_cache_size,
+        max_bytes=model_provider.cli_args.prompt_cache_bytes or (1 << 63),
+        disk_store=disk_store,
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -2410,7 +2430,35 @@ def main():
         "--prompt-cache-size",
         type=int,
         default=10,
-        help="Maximum number of distinct KV caches to hold in the prompt cache",
+        help="Maximum number of distinct KV caches to hold in the prompt cache "
+        "(0 = no entry limit; use --prompt-cache-bytes to bound memory)",
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-bytes",
+        type=_parse_size,
+        help="Spill evicted prompt caches to temporary disk storage up to this "
+        "many bytes instead of dropping them (cleared on exit)",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        choices=(2, 3, 4, 6, 8),
+        help="Quantize the KV cache to this many bits (sequential path only; "
+        "batching is disabled while set)",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        choices=(32, 64, 128),
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Quantize the KV cache from this token position onward (default: 0)",
     )
     parser.add_argument(
         "--prompt-cache-bytes",
