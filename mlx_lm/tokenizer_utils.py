@@ -500,7 +500,8 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
         return [self._postprocess_text(d) for d in decoded]
 
 
-AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+# transformers >=5.13 requires the config-class form (upstream #1465).
+AutoTokenizer.register(NewlineTokenizer, fast_tokenizer_class=NewlineTokenizer)
 
 
 def _match(a, b):

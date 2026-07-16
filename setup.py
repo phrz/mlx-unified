@@ -52,13 +52,13 @@ setup(
         # engine for delegated families (vlm_delegate) come from OUR mlx-vlm
         # fork — the draft-blocks branch carries the x_stream_draft_blocks
         # extension the server forwards, so mlx-unified owns which mlx-vlm it
-        # delegates to. transformers upper bound: 5.13.0 broke
-        # AutoTokenizer.register in a way mlx-lm's tokenizer_utils doesn't
-        # handle yet.
+        # delegates to. (The old <5.13 transformers cap protected the string-form
+        # AutoTokenizer.register; tokenizer_utils now uses the config-class form
+        # from upstream #1465, and the rebased mlx-vlm needs >=5.14.)
         "vision": [
             "mlx-vlm @ git+https://github.com/phrz/mlx-vlm@draft-blocks",
             "Pillow",
-            "transformers>=5.7.0,<5.13.0",
+            "transformers>=5.14.0",
         ],
     },
     entry_points={
