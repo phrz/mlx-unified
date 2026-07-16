@@ -367,6 +367,7 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        self.draft_kind = None  # drafter FAMILY (mtp/…) — None = classic draft
         self.delegate = None
         self.is_batchable = False
 
@@ -405,6 +406,7 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        self.draft_kind = None
         self.delegate = None
 
         # mlx-unified: families whose generation mode mlx-lm cannot express
@@ -454,15 +456,27 @@ class ModelProvider:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        # Load the draft model for speculative decoding
+        # Load the draft model for speculative decoding. A drafter-FAMILY
+        # checkpoint (mlx-vlm MTP assistant etc. — detected by model_type, or
+        # forced via --draft-kind) loads through the mlx_vlm.speculative
+        # registry and runs the drafter round loop instead of the classic
+        # same-tokenizer draft path (docs/PORTING-DRAFTERS.md).
         draft_model = None
+        draft_kind = None
         if draft_model_path is not None:
-            draft_model, draft_tokenizer = load(draft_model_path)
-            if draft_tokenizer.vocab_size != tokenizer.vocab_size:
-                logging.warning(
-                    "Draft model tokenizer does not match model tokenizer. "
-                    "Speculative decoding may not work as expected."
-                )
+            from .spec_delegate import is_drafter_checkpoint, load_drafter
+
+            cli_kind = getattr(self.cli_args, "draft_kind", None)
+            if cli_kind is not None or is_drafter_checkpoint(draft_model_path):
+                draft_model, draft_kind = load_drafter(draft_model_path, cli_kind)
+                logging.info(f"Loaded {draft_kind} drafter from {draft_model_path}")
+            else:
+                draft_model, draft_tokenizer = load(draft_model_path)
+                if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+                    logging.warning(
+                        "Draft model tokenizer does not match model tokenizer. "
+                        "Speculative decoding may not work as expected."
+                    )
 
         # Compute batchability
         is_batchable = draft_model is None
@@ -484,6 +498,7 @@ class ModelProvider:
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
+        self.draft_kind = draft_kind
         self.is_batchable = is_batchable
         self.vision_encoder = vision_encoder
 
@@ -1292,7 +1307,10 @@ class ResponseGenerator:
                 cache_key = prompt[:]
                 if cache is None:
                     cache = make_prompt_cache(self.model_provider.model)
-                    if self.model_provider.draft_model is not None:
+                    if (
+                        self.model_provider.draft_model is not None
+                        and self.model_provider.draft_kind is None
+                    ):
                         cache += make_prompt_cache(self.model_provider.draft_model)
 
             # An image span must never be split across prefill chunks (the
@@ -1319,6 +1337,7 @@ class ResponseGenerator:
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
+                draft_kind=self.model_provider.draft_kind,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=prefill_step_size,
@@ -2347,6 +2366,15 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--draft-kind",
+        type=str,
+        choices=["dflash", "eagle3", "mtp"],
+        default=None,
+        help="Drafter family for --draft-model (mlx-vlm speculative drafters). "
+        "Default: auto-detected from the drafter's HF model_type; plain LMs "
+        "keep using classic same-tokenizer speculative decoding.",
     )
     parser.add_argument(
         "--trust-remote-code",

@@ -654,6 +654,90 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def drafter_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    drafter: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    temperature: Optional[float] = None,
+    **kwargs,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """
+    Speculative decoding with a drafter-FAMILY checkpoint (mlx-vlm's MTP
+    assistant drafters, e.g. gemma-4 ``*-assistant``) instead of a plain
+    same-tokenizer draft model. The drafter round loop comes from the pinned
+    mlx_vlm.speculative package; the TARGET runs as this mlx-lm model, whose
+    class must implement the speculative hooks (speculative_verify_hidden /
+    speculative_logits_from_hidden / rollback_speculative_cache — currently
+    the gemma4 family; see docs/PORTING-DRAFTERS.md).
+
+    Yields ``(token, logprobs, from_draft)`` like speculative_generate_step.
+    Logprobs are only materialized for the first (prefill) token — the round
+    loop commits accepted tokens without full-vocab logprob tensors.
+    """
+    from .spec_delegate import mtp_rounds
+
+    if logits_processors:
+        raise ValueError(
+            "logits_processors are not supported with drafter-family "
+            "speculative decoding yet — drop them or unset --draft-kind."
+        )
+
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "speculative_verify_hidden"):
+        raise ValueError(
+            f"{type(lm).__name__} does not implement the drafter speculative "
+            "hooks — MTP drafter decoding currently supports the gemma4 family."
+        )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(model)
+
+    # Chunked prefill through the hook. The sink captures post-cache K/V, so
+    # the FINAL chunk's sink holds full-context shared KV for the drafter.
+    y = prompt[None] if prompt.ndim == 1 else prompt
+    hidden = None
+    shared: dict = {}
+    while y.shape[1] > prefill_step_size:
+        hidden, shared = lm.speculative_verify_hidden(
+            y[:, :prefill_step_size], prompt_cache
+        )
+        mx.eval(hidden)
+        y = y[:, prefill_step_size:]
+        mx.clear_cache()
+    hidden, shared = lm.speculative_verify_hidden(y, prompt_cache)
+
+    # First committed token comes straight off the prefill hidden.
+    logits = lm.speculative_logits_from_hidden(hidden[:, -1:])
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    first = sampler(logprobs)
+    mx.eval(first)
+    first_tok = first.reshape(-1)
+    yield first_tok[0], logprobs.squeeze(0).squeeze(0), False
+
+    greedy = temperature is not None and temperature == 0
+    rounds = mtp_rounds(
+        model,
+        drafter,
+        prompt_cache,
+        hidden,
+        shared,
+        first_bonus=int(first_tok[0].item()),
+        # _mtp_rounds counts the already-yielded first bonus itself (emitted=1).
+        max_tokens=max_tokens,
+        sampler=sampler,
+        greedy_sampling=greedy,
+    )
+    for tok, _ in rounds:
+        yield mx.array(tok, mx.uint32), None, True
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -698,6 +782,7 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
+    draft_kind = kwargs.pop("draft_kind", None)
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
@@ -705,6 +790,12 @@ def stream_generate(
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
         )
+    elif draft_kind is not None:
+        # Drafter-FAMILY speculation (mlx-vlm MTP assistant etc.) — a different
+        # round loop from the classic same-tokenizer draft below.
+        for k in ("max_kv_size", "prompt_progress_callback", "num_draft_tokens"):
+            kwargs.pop(k, None)
+        token_generator = drafter_generate_step(prompt, model, draft_model, **kwargs)
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)

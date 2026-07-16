@@ -585,6 +585,8 @@ class Gemma4TextModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        shared_kv_sink: Optional[dict] = None,
+        skip_final_norm: bool = False,
     ):
         # Make the initial hidden state
         embeds_provided = input_embeddings is not None
@@ -646,8 +648,13 @@ class Gemma4TextModel(nn.Module):
             )
 
             intermediates[idx] = (kvs, offset)
+            # Drafter hook (mlx-vlm speculative contract): expose the post-cache
+            # K/V per layer type — last write wins, so the sink ends up holding
+            # the full-context K/V an MTP assistant drafter cross-attends into.
+            if shared_kv_sink is not None:
+                shared_kv_sink[layer.layer_type] = kvs
 
-        return self.norm(h)
+        return h if skip_final_norm else self.norm(h)
 
 
 class Model(nn.Module):
@@ -681,6 +688,63 @@ class Model(nn.Module):
         if self.final_logit_softcapping is not None:
             out = logit_softcap(self.final_logit_softcapping, out)
         return out
+
+    # ---- Drafter-family speculative-decoding hooks (mlx-vlm contract) --------
+    # The mlx_vlm.speculative round loops duck-type their target: these mirror
+    # mlx-vlm's gemma4 LanguageModel hooks so MTP assistant drafters can run
+    # against the unified server's mlx-lm-loaded target (docs/PORTING-DRAFTERS.md).
+
+    def logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        """Project (already-normed) hidden states to logits, softcap included."""
+        if self.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(hidden)
+        else:
+            out = self.lm_head(hidden)
+        if self.final_logit_softcapping is not None:
+            out = logit_softcap(self.final_logit_softcapping, out)
+        return out
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return self.logits_from_hidden(self.model.norm(hidden))
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return self.model.norm(hidden)
+
+    def speculative_verify_hidden(self, verify_input: mx.array, prompt_cache):
+        """One target forward for a speculative verify (or prefill) step.
+
+        Returns ``(pre-norm hidden, shared_kv_states)`` — the preferred branch of
+        mlx-vlm's ``_mtp_verify_without_logits``, which sidesteps its cache-type
+        introspection fallbacks (mlx-lm cache classes wouldn't match them).
+        """
+        shared_kv_sink: dict = {}
+        hidden = self.model(
+            verify_input,
+            cache=prompt_cache,
+            shared_kv_sink=shared_kv_sink,
+            skip_final_norm=True,
+        )
+        return hidden, shared_kv_sink
+
+    def rollback_speculative_cache(
+        self, caches, gdn_states, accepted, block_size: int
+    ) -> int:
+        """Rewind target KV caches after a speculative round (rejected tail).
+
+        Batch-1 port of mlx-vlm's gemma4 hook: a plain trim of the rejected
+        suffix. ``gdn_states`` is accepted (and ignored) for API parity — Gemma 4
+        has no SSM/GDN state.
+        """
+        del gdn_states
+        if isinstance(accepted, (list, tuple)):
+            accepted = mx.array(accepted, dtype=mx.int32)
+        max_a = int(accepted.max().item()) if isinstance(accepted, mx.array) else int(accepted)
+        trim = block_size - (max_a + 1)
+        if trim > 0:
+            for c in caches:
+                if c is not None and hasattr(c, "trim"):
+                    c.trim(trim)
+        return max_a
 
     def sanitize(self, weights):
         sanitized = {}
