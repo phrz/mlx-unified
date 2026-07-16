@@ -547,7 +547,7 @@ def _make_logits_processors(args):
 
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     """Returns info dicts for the top `top_n` tokens from `logprobs`"""
-    if top_n <= 0:
+    if top_n <= 0 or logprobs is None:
         return ()
     sorted_indices = mx.argpartition(-logprobs, kth=top_n - 1)
     top_indices = sorted_indices[:top_n].tolist()
@@ -1355,7 +1355,13 @@ class ResponseGenerator:
                         gen.token,
                         current_state,
                         match_sequence,
-                        gen.logprobs[gen.token].item(),
+                        # Drafter-family rounds commit tokens without full-vocab
+                        # logprob tensors (that's the speedup) — 0.0 stands in.
+                        (
+                            gen.logprobs[gen.token].item()
+                            if gen.logprobs is not None
+                            else 0.0
+                        ),
                         finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
