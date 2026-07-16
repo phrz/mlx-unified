@@ -718,8 +718,8 @@ def drafter_generate_step(
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     first = sampler(logprobs)
     mx.eval(first)
-    first_tok = first.reshape(-1)
-    yield first_tok[0], logprobs.squeeze(0).squeeze(0), False
+    first_tok = int(first.reshape(-1)[0].item())
+    yield first_tok, logprobs.squeeze(0).squeeze(0), False
 
     greedy = temperature is not None and temperature == 0
     rounds = mtp_rounds(
@@ -728,14 +728,16 @@ def drafter_generate_step(
         prompt_cache,
         hidden,
         shared,
-        first_bonus=int(first_tok[0].item()),
+        first_bonus=first_tok,
         # _mtp_rounds counts the already-yielded first bonus itself (emitted=1).
         max_tokens=max_tokens,
         sampler=sampler,
         greedy_sampling=greedy,
     )
+    # Native ints, matching generate_step's yield convention (y.item()) — the
+    # detokenizer indexes its tokenmap with them directly.
     for tok, _ in rounds:
-        yield mx.array(tok, mx.uint32), None, True
+        yield int(tok), None, True
 
 
 def stream_generate(
