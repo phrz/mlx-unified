@@ -246,6 +246,9 @@ class GenerationArguments:
     # mlx-unified: opt-in x_stream_draft_blocks (stream-only; drafts are only
     # ever produced by delegated block-diffusion models, ignored elsewhere).
     stream_draft_blocks: bool = False
+    # mlx-unified: x_speculative=false disables the server's draft model for
+    # THIS request (A/B benchmarking drafted vs plain decode without a reload).
+    speculative: bool = True
 
 
 @dataclass
@@ -1134,7 +1137,10 @@ class ResponseGenerator:
             # Load the model and tokenizer
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
-            draft_model = self.model_provider.draft_model
+            # x_speculative=false: run THIS request undrafted (A/B benchmarking).
+            draft_model = (
+                self.model_provider.draft_model if args.speculative else None
+            )
 
             # mlx-unified: delegated VLM families are rendered, tokenized and
             # generated wholesale by mlx-vlm — route before any of mlx_lm's
@@ -1748,6 +1754,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # mlx-unified: opt-in draft-block streaming (delegated diffusion VLMs);
         # tolerated and ignored for every other model.
         self.x_stream_draft_blocks = self.body.get("x_stream_draft_blocks", False)
+        self.x_speculative = bool(self.body.get("x_speculative", True))
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1963,6 +1970,7 @@ class APIHandler(BaseHTTPRequestHandler):
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
             stream_draft_blocks=self.stream and self.x_stream_draft_blocks,
+            speculative=self.x_speculative,
         )
 
         # Keep connection allive during long prompt processing (and also log
