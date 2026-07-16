@@ -300,6 +300,14 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
+        # Rotating (sliding-window) caches are BOUNDED at window_size tokens, so
+        # quantizing them saves almost nothing — and their circular rewrite has no
+        # quantized implementation. Skipping them (instead of raising) is what
+        # makes --kv-bits usable on sliding-window models (gemma): the UNBOUNDED
+        # full-attention layers — nearly all KV memory at long context — still
+        # quantize.
+        if isinstance(c, (RotatingKVCache, BatchRotatingKVCache)):
+            continue
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
