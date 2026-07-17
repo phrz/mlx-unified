@@ -53,6 +53,12 @@ Upstream README follows.
 
 ---
 
+## Pending upstream changes
+
+Fixes we carry that upstream mlx-lm / mlx-vlm would benefit from are tracked in
+[docs/UPSTREAMING.md](docs/UPSTREAMING.md) — the queue of candidates, their
+commits, and their status. Nothing is PR'd upstream without explicit sign-off.
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
