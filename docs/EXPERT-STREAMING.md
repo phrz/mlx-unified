@@ -71,3 +71,34 @@ a ~100GB budget should land in the low-to-mid single digits tok/s (mlx-moe:
 6–23 on a much smaller model; SwiftLM: ~6 on 122B) — SSD latency is the
 floor, and DSA/MLA attention still runs dense. This is a "have the huge model
 available alongside everything else" mode, not a speed mode.
+
+
+## Status + open bug (2026-07-17, post-integration)
+
+Mechanics land (7.5GB wired for 16.6GB Qwen3-30B-A3B at cap 52/128; swaps,
+drains, refinement all run). CONTROL: mlx-moe's own server on the identical
+model+capacity produces flawless output — the ceiling is reachable.
+
+Our server's output quality is UNSTABLE run-to-run (isolated wrong tokens →
+repetition collapse; one fully-clean cold request observed after adding a
+pipeline drain, not reproducible). Attempted fixes so far: mx.synchronize()
+before slot mutation (default stream, then generation_stream too), disabling
+cross-request prompt-cache reuse/insert under streaming (principled — decode
+KV is computed through the approximate skip-fallback path — keep regardless).
+Neither stabilized it; signal is noisy, likely a race.
+
+Next-session plan (deterministic, no more shotgun):
+1. Same converged prepacked cache state in BOTH stacks, temp 0, fixed prompt.
+2. Debug hook capturing per-token logits (or argmax id) in our serve loop and
+   in mlx-moe's Server._stream; find the FIRST divergent token.
+3. Candidate deltas to check, in order: our fork's generate_step pipeline
+   depth + thread-local generation_stream vs the server's worker thread
+   (dynamic_cache_update mutating slots the in-flight graph reads); our
+   chunked prefill (prefill_step_size) vs their single-shot prefill through
+   lazy expert loading; detokenizer/think-parse (cosmetic only).
+4. If the race is pipeline-depth: consider running dynamic_cache_update on
+   generation_stream itself (ordering instead of draining).
+
+GLM-5.2 Alis 2.56bpw (~225GB) is downloaded and waiting in the runway store.
+Runway-side plumbing (spec/args/estimator) deliberately deferred until this
+stabilizes.

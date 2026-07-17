@@ -1364,11 +1364,17 @@ class ResponseGenerator:
                             eos_token_ids=tokenizer._eos_token_ids,
                         )
             else:
-                # Load the KV cache
+                # Load the KV cache. Streamed-expert decode computes KV through
+                # the approximate (skip-fallback) expert path — reusing it as a
+                # PREFIX for a later request bakes those approximations into an
+                # otherwise-exact prefill, so cross-request reuse is disabled.
                 self._log_cache_stats()
-                cache, rest = self.prompt_cache.fetch_nearest_cache(
-                    self.model_provider.model_key, prompt
-                )
+                if getattr(self.cli_args, "stream_experts", False):
+                    cache, rest = None, prompt
+                else:
+                    cache, rest = self.prompt_cache.fetch_nearest_cache(
+                        self.model_provider.model_key, prompt
+                    )
                 ctx.prompt_cache_count = len(prompt) - len(rest)
                 cache_key = prompt[:]
                 if cache is None:
@@ -1435,6 +1441,15 @@ class ResponseGenerator:
                     interval, budget = _policy(tokens_done)
                     if tokens_done % interval != 0:
                         return
+                    # Drain the async pipeline before mutating expert slots: our
+                    # generate_step dispatches the NEXT token's forward while this
+                    # one yields — swapping slot tensors mid-flight corrupts that
+                    # in-flight token. Sync the GENERATION stream specifically
+                    # (bare synchronize() only drains the default stream).
+                    from .generate import generation_stream as _gs
+
+                    mx.synchronize(_gs)
+                    mx.synchronize()
                     stats = dynamic_cache_update(model, max_layer_updates=budget)
                     swaps = sum(x.get("swaps", 0) for x in stats)
                     fallbacks = sum(x.get("fallbacks", 0) for x in stats)
@@ -1531,7 +1546,7 @@ class ResponseGenerator:
             # Save the KV cache again, into the vision-namespaced key when this was a
             # multimodal request (see above) so a later turn that repeats the same
             # image(s) can find it.
-            if cache_key is not None:
+            if cache_key is not None and not getattr(self.cli_args, "stream_experts", False):
                 insert_key = image_model_key if vision is not None else self.model_provider.model_key
                 self.prompt_cache.insert_cache(insert_key, cache_key, cache)
 
