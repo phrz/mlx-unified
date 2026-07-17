@@ -57,6 +57,9 @@ setup(
         # from upstream #1465, and the rebased mlx-vlm needs >=5.14.)
         "vision": [
             "mlx-vlm @ git+https://github.com/phrz/mlx-vlm@draft-blocks",
+            # Expert-aware SSD streaming (--stream-experts): lazy SwitchGLU expert
+            # cache, MIT, built ON mlx-lm — import-not-vendor, pinned for stability.
+            "mlx-moe @ git+https://github.com/mu-hashmi/mlx-moe@f054a9dc3b7ec9e91689249cd51390ddd6712047",
             "Pillow",
             "transformers>=5.14.0",
         ],

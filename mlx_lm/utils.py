@@ -285,6 +285,12 @@ def _download(
 
 
 def hf_repo_to_path(hf_repo):
+    # A local checkpoint directory is already a path — callers (including the
+    # pinned mlx-moe's _startup) pass whatever the server was given, and
+    # snapshot_download rejects filesystem paths as invalid repo ids.
+    p = Path(hf_repo)
+    if p.exists():
+        return p
     return Path(snapshot_download(hf_repo, local_files_only=True))
 
 

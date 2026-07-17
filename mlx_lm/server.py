@@ -438,7 +438,64 @@ class ModelProvider:
                 return
 
         # Load the model and tokenizer
-        if self.is_distributed:
+        if getattr(self.cli_args, "stream_experts", False):
+            # Expert-aware SSD streaming (mlx-moe, pinned in [vision]): load lazy,
+            # swap SwitchGLU expert stacks for capacity-bounded cached versions,
+            # pin universal experts, warm the cache. The returned objects are
+            # ordinary mlx-lm (model, tokenizer) — stock stream_generate and the
+            # prompt-cache layer work unchanged; decode must stay SEQUENTIAL.
+            if self.is_distributed or adapter_path is not None:
+                raise ValueError(
+                    "--stream-experts is incompatible with distributed mode and adapters."
+                )
+            try:
+                from mlx_moe.lazy_experts.generate import _startup
+            except ImportError as e:
+                raise RuntimeError(
+                    "--stream-experts needs the mlx-moe package — install the "
+                    "unified fork's vision extra: mlx-lm[vision]."
+                ) from e
+            warmup_prompt = (
+                "Write a Python function that implements binary search on a sorted array."
+            )
+            # Namespace saved cache/prepack state by capacity — a prepacked state
+            # restores ITS capacity, which would silently override a different
+            # explicit --expert-capacity.
+            cap_tag = self.cli_args.expert_capacity or "auto"
+            model, tokenizer, _ = _startup(
+                model_path,
+                warmup_prompt,
+                cache_dir=str(Path.home() / ".cache" / "mlx-moe" / f"cap-{cap_tag}"),
+                profile_path=self.cli_args.expert_profile,
+                capacity=self.cli_args.expert_capacity,
+                warmup=self.cli_args.expert_warmup,
+            )
+            if self.cli_args.expert_warmup == "hybrid":
+                # Startup refinement (mlx-moe Server protocol): run varied prompts
+                # with aggressive between-token updates until swaps go quiet — the
+                # cold cache converges BEFORE user traffic instead of during it.
+                from mlx_moe.lazy_experts.core import dynamic_cache_update
+                from .generate import stream_generate as _sg
+
+                for text in (
+                    "Write Python code that validates JSON input and returns structured errors.",
+                    "Summarize how ocean tides work, then list three prime numbers.",
+                ):
+                    p = text
+                    if tokenizer.chat_template is not None:
+                        p = tokenizer.apply_chat_template(
+                            [{"role": "user", "content": text}],
+                            add_generation_prompt=True,
+                            tokenize=False,
+                        )
+                    for _ in _sg(model, tokenizer, p, max_tokens=24):
+                        dynamic_cache_update(model, max_layer_updates=48)
+                    for _ in range(8):
+                        stats = dynamic_cache_update(model, max_layer_updates=32)
+                        if sum(x.get("swaps", 0) for x in stats) == 0:
+                            break
+                logging.info("Expert cache refined (startup warmup complete)")
+        elif self.is_distributed:
             model, tokenizer = sharded_load(
                 model_path,
                 pipeline_group=self.pipeline_group,
@@ -483,6 +540,9 @@ class ModelProvider:
 
         # Compute batchability
         is_batchable = draft_model is None
+        # Streamed-expert modules serve one request at a time (the per-layer
+        # expert cache is shared state without per-request isolation).
+        is_batchable = is_batchable and not getattr(self.cli_args, "stream_experts", False)
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
@@ -1333,6 +1393,63 @@ class ResponseGenerator:
                 generate_kwargs["kv_group_size"] = self.cli_args.kv_group_size
                 generate_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
 
+            # Streamed-expert maintenance: swap missed experts in BETWEEN tokens
+            # (mlx-moe's Server protocol, ported faithfully — the adaptive
+            # interval/budget driven by the observed fallback rate is what keeps
+            # a capacity-bounded cache converged; a fixed schedule was measurably
+            # not enough). After the stream ends, drain rounds finish convergence
+            # so the NEXT request starts warm.
+            expert_update = None
+            expert_drain = None
+            if getattr(self.cli_args, "stream_experts", False):
+                from mlx_moe.lazy_experts.core import dynamic_cache_update
+
+                _fb_rate = 0.0
+                _no_swap = 0
+                _low_fb = 0
+
+                def _policy(gen_tokens: int) -> tuple:
+                    if _fb_rate >= 0.35:
+                        interval, budget = 1, 48
+                    elif _fb_rate >= 0.20:
+                        interval, budget = 1, 32
+                    elif _fb_rate >= 0.10:
+                        interval, budget = 2, 24
+                    elif gen_tokens <= 32:
+                        interval, budget = 2, 24
+                    elif gen_tokens <= 96:
+                        interval, budget = 3, 16
+                    else:
+                        interval, budget = 4, 12
+                    if _no_swap >= 4 and _fb_rate < 0.15:
+                        interval *= 2
+                        budget = max(8, budget // 2)
+                    if _low_fb >= 6 and _fb_rate < 0.08:
+                        interval, budget = max(interval, 12), 8
+                    if _low_fb >= 12 and _fb_rate < 0.05:
+                        interval, budget = max(interval, 20), 8
+                    return interval, budget
+
+                def expert_update(tokens_done: int) -> None:
+                    nonlocal _fb_rate, _no_swap, _low_fb
+                    interval, budget = _policy(tokens_done)
+                    if tokens_done % interval != 0:
+                        return
+                    stats = dynamic_cache_update(model, max_layer_updates=budget)
+                    swaps = sum(x.get("swaps", 0) for x in stats)
+                    fallbacks = sum(x.get("fallbacks", 0) for x in stats)
+                    requests = sum(x.get("requests", 0) for x in stats)
+                    if requests > 0:
+                        _fb_rate = fallbacks / requests
+                        _low_fb = _low_fb + 1 if (fallbacks / requests) <= 0.005 else 0
+                    _no_swap = _no_swap + 1 if swaps == 0 else 0
+
+                def expert_drain() -> None:
+                    for _ in range(8):
+                        stats = dynamic_cache_update(model, max_layer_updates=32)
+                        if sum(x.get("swaps", 0) for x in stats) == 0:
+                            break
+
             # Process the prompt and generate tokens
             for gen in stream_generate(
                 model=model,
@@ -1376,6 +1493,8 @@ class ResponseGenerator:
                 )
                 if cache_key is not None:
                     cache_key.append(gen.token)
+                if expert_update is not None:
+                    expert_update(gen.generation_tokens)
 
                 if ctx._should_stop:
                     if self._is_distributed:
@@ -1403,6 +1522,11 @@ class ResponseGenerator:
                     )
 
             rqueue.put(None)
+
+            # Streamed experts: drain remaining swaps so the NEXT request starts
+            # with a converged cache instead of paying misses mid-generation.
+            if expert_drain is not None:
+                expert_drain()
 
             # Save the KV cache again, into the vision-namespaced key when this was a
             # multimodal request (see above) so a later turn that repeats the same
@@ -2380,6 +2504,34 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--stream-experts",
+        action="store_true",
+        help="Expert-aware SSD streaming for MoE models (mlx-moe): only "
+        "router-selected experts are resident, in a capacity-bounded per-layer "
+        "cache; the rest stream from disk. Sequential decode only.",
+    )
+    parser.add_argument(
+        "--expert-capacity",
+        type=int,
+        default=None,
+        help="Experts cached per MoE layer with --stream-experts "
+        "(default: auto from available RAM).",
+    )
+    parser.add_argument(
+        "--expert-profile",
+        type=str,
+        default=None,
+        help="Expert-usage profile JSON for pinning universal experts "
+        "(mlx-moe profile format; default: auto-discovered).",
+    )
+    parser.add_argument(
+        "--expert-warmup",
+        type=str,
+        choices=["hybrid", "full", "none"],
+        default="hybrid",
+        help="Cache warmup strategy for --stream-experts (default: hybrid).",
     )
     parser.add_argument(
         "--draft-kind",
