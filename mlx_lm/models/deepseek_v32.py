@@ -24,6 +24,9 @@ class ModelArgs(BaseModelArgs):
     index_head_dim: int = 128
     index_n_heads: int = 64
     index_topk: int = 2048
+    # GLM-5.2: per-layer "full" | "shared" — shared layers reuse the previous
+    # full layer's DSA top-k selection and carry no indexer weights.
+    indexer_types: Optional[list] = None
     intermediate_size: int = 11008
     moe_intermediate_size: int = 1407
     num_hidden_layers: int = 30
@@ -115,7 +118,7 @@ class Indexer(nn.Module):
 
 
 class DeepseekV32Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, layer_idx: int = 0):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -166,7 +169,13 @@ class DeepseekV32Attention(nn.Module):
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
 
-        self.indexer = Indexer(config)
+        # GLM-5.2 cross-layer top-k sharing: "shared" layers carry no indexer
+        # weights and reuse the previous "full" layer's token selection.
+        indexer_types = getattr(config, "indexer_types", None)
+        self.skip_topk = (
+            indexer_types is not None and indexer_types[layer_idx] == "shared"
+        )
+        self.indexer = None if self.skip_topk else Indexer(config)
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -180,7 +189,8 @@ class DeepseekV32Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
         B, L, D = x.shape
 
         qr = self.q_a_layernorm(self.q_a_proj(x))
@@ -204,7 +214,10 @@ class DeepseekV32Attention(nn.Module):
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        if self.indexer is not None:
+            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        else:
+            topk_indices = prev_topk_indices
         if topk_indices is not None:
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
@@ -232,7 +245,7 @@ class DeepseekV32Attention(nn.Module):
                 mask = sparse_mask
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
-        if cache is not None and cache[0] is not None:
+        if self.indexer is not None and cache is not None and cache[0] is not None:
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
@@ -257,7 +270,7 @@ class DeepseekV32Attention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return self.o_proj(output), topk_indices
 
 
 class DeepseekV32MLP(nn.Module):
@@ -380,7 +393,7 @@ class DeepseekV32MoE(nn.Module):
 class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekV32Attention(config)
+        self.self_attn = DeepseekV32Attention(config, layer_idx)
         self.mlp = (
             DeepseekV32MoE(config)
             if (
@@ -400,11 +413,14 @@ class DeepseekV32DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
+        r, topk_indices = self.self_attn(
+            self.input_layernorm(x), mask, cache, prev_topk_indices
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        return h + r, topk_indices
 
 
 class DeepseekV32Model(nn.Module):
@@ -460,8 +476,11 @@ class DeepseekV32Model(nn.Module):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
+        topk_indices = None
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+            h, topk_indices = self.layers[self.start_idx + i](
+                h, mask, cache[i], topk_indices
+            )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -652,4 +671,12 @@ class Model(nn.Module):
         return predicate
 
     def make_cache(self):
-        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
+        # Shared-indexer layers never touch cache[1]; giving them one would
+        # leave an un-updated KVCache whose state (keys=None) breaks eval/save.
+        types = getattr(self.args, "indexer_types", None)
+        return [
+            CacheList(KVCache(), KVCache())
+            if types is None or types[i] == "full"
+            else CacheList(KVCache())
+            for i in range(len(self.layers))
+        ]

@@ -43,6 +43,8 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
     indexer_rope_interleave: bool = True
+    # GLM-5.2: per-layer "full" | "shared" DSA indexer sharing (see deepseek_v32).
+    indexer_types: Optional[list] = None
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
