@@ -73,32 +73,33 @@ floor, and DSA/MLA attention still runs dense. This is a "have the huge model
 available alongside everything else" mode, not a speed mode.
 
 
-## Status + open bug (2026-07-17, post-integration)
+## Status (2026-07-17, delegation architecture)
 
-Mechanics land (7.5GB wired for 16.6GB Qwen3-30B-A3B at cap 52/128; swaps,
-drains, refinement all run). CONTROL: mlx-moe's own server on the identical
-model+capacity produces flawless output — the ceiling is reachable.
+The hand-rolled expert machinery was replaced by DELEGATION: `--stream-experts`
+now runs mlx-moe's own `Server` session (`_MoeSession`) on a dedicated
+single-thread executor; `_serve_streamed_experts` tokenizes with our chat
+template, keys the mlx-moe prompt cache per conversation (sha256 of the first
+user message), and adapts `session._stream(...)` responses back into our SSE
+loop. Everything else in the fork (prompt cache, drafters, diffusion, vision)
+is untouched on the non-streamed path.
 
-Our server's output quality is UNSTABLE run-to-run (isolated wrong tokens →
-repetition collapse; one fully-clean cold request observed after adding a
-pipeline drain, not reproducible). Attempted fixes so far: mx.synchronize()
-before slot mutation (default stream, then generation_stream too), disabling
-cross-request prompt-cache reuse/insert under streaming (principled — decode
-KV is computed through the approximate skip-fallback path — keep regardless).
-Neither stabilized it; signal is noisy, likely a race.
+Post-mortem on the earlier "unstable output" bug hunt: the dominant cause was
+the TEST HARNESS, not the server — zsh arrays are 1-indexed, so the
+`declare -a`-based multi-question batteries sent an EMPTY first prompt and
+shifted every subsequent one. With a Python harness the delegate answers
+correctly. The residual truth: at aggressive capacity (52/128 experts on
+Qwen3-30B under topic churn) quality degrades EVEN ON mlx-moe's own server —
+an engine-inherent limit of capacity-bounded expert caching, not an
+integration bug. Use temp ~0.7 (greedy loops on approximate experts), and
+size capacity generously.
 
-Next-session plan (deterministic, no more shotgun):
-1. Same converged prepacked cache state in BOTH stacks, temp 0, fixed prompt.
-2. Debug hook capturing per-token logits (or argmax id) in our serve loop and
-   in mlx-moe's Server._stream; find the FIRST divergent token.
-3. Candidate deltas to check, in order: our fork's generate_step pipeline
-   depth + thread-local generation_stream vs the server's worker thread
-   (dynamic_cache_update mutating slots the in-flight graph reads); our
-   chunked prefill (prefill_step_size) vs their single-shot prefill through
-   lazy expert loading; detokenizer/think-parse (cosmetic only).
-4. If the race is pipeline-depth: consider running dynamic_cache_update on
-   generation_stream itself (ordering instead of draining).
+GLM-5.2 (glm_moe_dsa) needed model-side work in the fork: the Alis 2.56bpw
+checkpoint uses GLM-5.2's cross-layer DSA indexer sharing
+(`config.indexer_types`: "full" every 4th layer, "shared" between), which
+upstream mlx-lm doesn't support — shared layers carry no indexer weights and
+reuse the previous full layer's top-k selection, threaded through the decoder
+loop (matches transformers' `modeling_glm_moe_dsa`). GLM's activation ratio
+(8/256 routed) gives expert streaming a far better cushion than the 30B proxy.
 
-GLM-5.2 Alis 2.56bpw (~225GB) is downloaded and waiting in the runway store.
-Runway-side plumbing (spec/args/estimator) deliberately deferred until this
-stabilizes.
+Runway-side plumbing (spec/args/estimator) lands after GLM-5.2 verifies
+end-to-end.
