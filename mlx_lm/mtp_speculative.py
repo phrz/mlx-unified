@@ -67,7 +67,14 @@ def mtp_speculative_generate(
     acceptance test is exact token equality (Colibrì-style), not stochastic
     speculative sampling.
     """
+    from .generate import wired_limit
+
     stats = MtpStats()
+    with wired_limit(model):
+        return _generate(model, prompt_ids, stats, max_tokens, num_draft, eos_ids, on_tokens, after_forward)
+
+
+def _generate(model, prompt_ids, stats, max_tokens, num_draft, eos_ids, on_tokens, after_forward):
     cache = make_prompt_cache(model)
     hid = model.model(mx.array([prompt_ids]), cache)[:, -1:, :]
     nxt = mx.argmax(model.lm_head(hid), axis=-1)  # (1, 1)

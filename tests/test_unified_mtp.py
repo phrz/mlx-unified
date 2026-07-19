@@ -145,3 +145,24 @@ class TestMtpHead(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNgramSpeculative(unittest.TestCase):
+    def test_propose_copies_from_context(self):
+        from mlx_lm.ngram_speculative import ngram_propose
+
+        # "...5 6 7 8 ... 5 6" — suffix (5,6) recurred; propose what followed: 7 8
+        ctx = [1, 2, 5, 6, 7, 8, 3, 4, 5, 6]
+        self.assertEqual(ngram_propose(ctx, max_draft=2), [7, 8])
+        # no recurrence → no draft
+        self.assertEqual(ngram_propose([1, 2, 3, 4, 5], max_draft=4), [])
+
+    def test_generate_loop(self):
+        from mlx_lm.ngram_speculative import ngram_speculative_generate
+
+        m = tiny_model()
+        out, st = ngram_speculative_generate(m, [1, 2, 3, 1, 2], max_tokens=12, num_draft=4)
+        self.assertGreaterEqual(len(out), 12)
+        self.assertEqual(st.tokens, len(out))
+        self.assertLessEqual(st.accepted, st.proposed)
+        self.assertGreaterEqual(st.rounds, 1)
