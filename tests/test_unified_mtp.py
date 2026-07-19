@@ -95,6 +95,29 @@ class TestMtpHead(unittest.TestCase):
         self.assertTrue(bool(mx.all(mx.isfinite(logits2))))
         self.assertEqual(cache[0].offset, 2)
 
+    def test_speculative_generate_loop(self):
+        from mlx_lm.mtp_speculative import mtp_speculative_generate
+
+        m = tiny_model(num_nextn_predict_layers=1)
+        forwards = []
+        out, st = mtp_speculative_generate(
+            m,
+            [1, 2, 3],
+            max_tokens=12,
+            num_draft=2,
+            after_forward=lambda: forwards.append(1),
+        )
+        self.assertGreaterEqual(len(out), 12)  # rounds emit 1..K+1, may overshoot by K
+        self.assertEqual(st.tokens, len(out))
+        # Each round drafts num_draft tokens, except a final round clamped to
+        # the remaining budget (K = min(num_draft, max_tokens - len(out))).
+        self.assertLessEqual(st.proposed, 2 * st.rounds)
+        self.assertGreaterEqual(st.proposed, 2 * st.rounds - 1)
+        self.assertLessEqual(st.accepted, st.proposed)
+        # prefill + one per verify round
+        self.assertEqual(len(forwards), 1 + st.rounds)
+        self.assertTrue(all(isinstance(t, int) for t in out))
+
     def test_glm_moe_dsa_wrapper_accepts_mtp_config(self):
         from mlx_lm.models import glm_moe_dsa
 
