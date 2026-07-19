@@ -113,10 +113,14 @@ def eagle3_rounds(
     max_tokens: int,
     sampler,
     greedy_sampling: bool,
+    draft_block_size=None,
 ):
     """The single-request EAGLE3 round-loop generator, from mlx_vlm.speculative.
     `hidden` is the CONCATENATED aux hidden of the prompt (capture_layer_ids
-    forward); the target must implement rollback_speculative_cache."""
+    forward); the target must implement rollback_speculative_cache.
+    `draft_block_size` overrides the round loop's conservative min-2 clamp: pass an
+    int to propose+verify that many draft tokens per round (up to the drafter's
+    trained ttt capacity); None keeps the clamp."""
     from mlx_vlm.speculative.eagle3 import _eagle3_rounds
 
     return _eagle3_rounds(
@@ -129,6 +133,7 @@ def eagle3_rounds(
         max_tokens=max_tokens,
         sampler=sampler,
         greedy_sampling=greedy_sampling,
+        draft_block_size=draft_block_size,
     )
 
 

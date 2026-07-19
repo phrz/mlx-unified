@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import os
 import sys
 import time
 from collections import deque
@@ -662,6 +663,27 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+# EAGLE3 draft block size (draft tokens proposed + verified per round). The mlx-vlm
+# round loop hard-clamps to 2 when it receives None (conservative default); passing an
+# explicit value unlocks the drafter's trained capacity (ttt≈7). Resolution order:
+# a process-global override (set by the sweep harness between runs on one loaded model),
+# then RUNWAY_EAGLE3_BLOCK env (set by the daemon per instance), else None (=clamp to 2).
+_EAGLE3_BLOCK_OVERRIDE: Optional[int] = None
+
+
+def _resolve_eagle3_block() -> Optional[int]:
+    if _EAGLE3_BLOCK_OVERRIDE is not None:
+        return _EAGLE3_BLOCK_OVERRIDE
+    v = os.environ.get("RUNWAY_EAGLE3_BLOCK")
+    if v:
+        try:
+            n = int(v)
+            return n if n >= 2 else None
+        except ValueError:
+            return None
+    return None
+
+
 def _eagle3_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -738,6 +760,7 @@ def _eagle3_generate_step(
         max_tokens=max_tokens,
         sampler=sampler,
         greedy_sampling=greedy,
+        draft_block_size=_resolve_eagle3_block(),
     )
     for tok, _ in rounds:
         yield int(tok), None, True
