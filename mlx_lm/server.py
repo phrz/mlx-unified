@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 import pickle
 import platform
 import socket
@@ -1586,6 +1587,61 @@ class ResponseGenerator:
                     break
         kv_key = _hashlib.sha256(first_user.encode()).hexdigest()[:16]
 
+        # Baked-MTP self-speculation (GLM-5.2 nextn head): greedy requests run the
+        # draft-K + batched-verify loop instead of the session's per-token loop —
+        # the batched verify amortizes expert loads across positions (measured
+        # ~1.5x at K=2 over the same streamed cache). Greedy-only by design
+        # (acceptance is exact token equality); sampled requests, and MTP_SPEC=0,
+        # fall through to the session loop. Trade-off: no cross-request KV-prefix
+        # reuse on this path (fresh cache per request).
+        temp = args.sampling.temperature
+        use_mtp = (
+            getattr(self.model_provider.model, "mtp", None) is not None
+            and os.environ.get("MTP_SPEC", "1") != "0"
+            and (temp is None or temp == 0)
+        )
+
+        def consume_mtp():
+            from mlx_moe.lazy_experts.core import dynamic_cache_update
+
+            from .mtp_speculative import mtp_speculative_generate
+
+            model = self.model_provider.model
+            detok = tokenizer.detokenizer
+            detok.reset()
+            eos = set(getattr(tokenizer, "eos_token_ids", None) or [])
+            if tokenizer.eos_token_id is not None:
+                eos.add(tokenizer.eos_token_id)
+
+            def on_tokens(toks):
+                for t in toks:
+                    detok.add_token(t)
+                    rqueue.put(
+                        Response(detok.last_segment, t, "normal", None, 0.0, None, ())
+                    )
+
+            out, stats = mtp_speculative_generate(
+                model,
+                list(prompt),
+                max_tokens=args.max_tokens,
+                num_draft=int(os.environ.get("MTP_DRAFT_K", "2")),
+                eos_ids=eos,
+                on_tokens=on_tokens,
+                after_forward=lambda: dynamic_cache_update(
+                    model, max_layer_updates=48
+                ),
+            )
+            detok.finalize()
+            finish = "stop" if out and out[-1] in eos else "length"
+            rqueue.put(
+                Response(detok.last_segment, out[-1] if out else 0, "normal", None, 0.0, finish, ())
+            )
+            rqueue.put(None)
+            logging.info(
+                f"[mtp] {stats.tokens} tokens, {stats.rounds} rounds, "
+                f"acceptance {100 * stats.acceptance:.1f}%"
+            )
+
         def consume():
             for resp in session._stream(
                 list(prompt), args.max_tokens, kv_key, **sampling
@@ -1603,7 +1659,7 @@ class ResponseGenerator:
                 )
             rqueue.put(None)
 
-        executor.submit(consume).result()
+        executor.submit(consume_mtp if use_mtp else consume).result()
 
     def _serve_delegated_diffusion(self, rqueue, request, args):
         """Serve one request from a delegated VLM family (mlx-unified).
