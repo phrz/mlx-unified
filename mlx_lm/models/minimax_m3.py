@@ -1063,6 +1063,20 @@ class Model(nn.Module):
         # branch. Rebuild the MoE blocks unpacked so the module tree matches the
         # checkpoint — plain SwitchGLU is also the layout the expert-streaming
         # delegate knows how to stream.
+        # Quants that stripped the MSA indexer can ship it back as a SIDECAR
+        # (msa_indexer.safetensors — the original repo's bf16 index_* tensors,
+        # ~0.5 GB; see the extraction script in EXPERT-STREAMING.md notes). Merge
+        # it before the dense-fallback check so sparse attention re-activates —
+        # at long context MSA is the difference between full-KV dense reads and
+        # top-k block reads per token.
+        if not any(k.endswith("self_attn.index_q_proj.weight") for k in weights):
+            import os
+
+            base = getattr(self, "_model_path", None)  # set by utils.load_model
+            sidecar = os.path.join(str(base), "msa_indexer.safetensors") if base else ""
+            if sidecar and os.path.exists(sidecar):
+                weights.update(mx.load(sidecar))
+
         # Checkpoints exported WITHOUT the MSA indexer weights (e.g. pipenetwork's
         # mixed-bit quant ships no self_attn.index_*): fall back to DENSE attention
         # — the exact form the sparse indexer approximates — by clearing the

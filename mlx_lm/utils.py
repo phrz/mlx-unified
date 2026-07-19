@@ -389,6 +389,9 @@ def load_model(
 
     model = model_class(model_args)
 
+    # mlx-unified: let sanitize() find checkpoint-adjacent sidecar files (e.g.
+    # minimax_m3's msa_indexer.safetensors re-adding stripped MSA weights).
+    model._model_path = model_path
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
