@@ -19,7 +19,7 @@ _INSTALL_HINT = (
 # v1 scope: the MTP assistant round loop is target-hook-complete for gemma4.
 # dflash/eagle3 need capture_layer_ids prefill hooks the mlx-lm side doesn't
 # implement yet — reject them clearly rather than fail deep in a round.
-SUPPORTED_KINDS = {"mtp"}
+SUPPORTED_KINDS = {"mtp", "eagle3"}
 
 
 def _speculative():
@@ -100,3 +100,40 @@ def mtp_rounds(
         sampler=sampler,
         greedy_sampling=greedy_sampling,
     )
+
+
+def eagle3_rounds(
+    model: Any,
+    drafter: Any,
+    prompt_cache: list,
+    hidden: Any,
+    *,
+    prompt_tokens=None,
+    first_bonus: int,
+    max_tokens: int,
+    sampler,
+    greedy_sampling: bool,
+):
+    """The single-request EAGLE3 round-loop generator, from mlx_vlm.speculative.
+    `hidden` is the CONCATENATED aux hidden of the prompt (capture_layer_ids
+    forward); the target must implement rollback_speculative_cache."""
+    from mlx_vlm.speculative.eagle3 import _eagle3_rounds
+
+    return _eagle3_rounds(
+        model,
+        drafter,
+        prompt_cache,
+        hidden,
+        prompt_tokens=prompt_tokens,
+        first_bonus=first_bonus,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        greedy_sampling=greedy_sampling,
+    )
+
+
+def eagle3_capture_layer_ids(drafter: Any) -> list:
+    """The target layer ids this drafter wants captured."""
+    from mlx_vlm.speculative.eagle3 import _eagle3_capture_layer_ids
+
+    return _eagle3_capture_layer_ids(drafter)

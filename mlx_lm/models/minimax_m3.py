@@ -938,6 +938,17 @@ class MiniMaxSparseMoeBlock(nn.Module):
         return y
 
 
+@dataclass
+class SpeculativeOutput:
+    """Duck-typed output for the mlx-vlm speculative round loop (EAGLE3):
+    logits + the captured aux hiddens; gdn_states is None for standard-KV
+    models. Local so text-only mlx_lm never imports mlx_vlm."""
+
+    logits: mx.array
+    hidden_states: List[mx.array]
+    gdn_states: Optional[Any] = None
+
+
 class MiniMaxDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -989,6 +1000,7 @@ class MiniMaxM3Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
     ):
         if input_embeddings is not None:
             h = input_embeddings
@@ -1000,10 +1012,19 @@ class MiniMaxM3Model(nn.Module):
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        # EAGLE3 aux-hidden capture: post-layer (post-residual, pre-final-norm)
+        # states at the drafter's capture ids, in ascending layer order.
+        capture = set(capture_layer_ids) if capture_layer_ids is not None else None
+        captured: List[mx.array] = []
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c)
+            if capture is not None and i in capture:
+                captured.append(h)
 
-        return self.norm(h)
+        out = self.norm(h)
+        if capture is not None:
+            return out, captured
+        return out
 
 
 class Model(nn.Module):
@@ -1020,13 +1041,43 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
     ):
+        # EAGLE3 target hook: with capture_layer_ids, return an output object
+        # (logits + captured aux hiddens) the mlx-vlm speculative round loop
+        # duck-types against — see _eagle3_verify_target. Plain calls keep the
+        # bare-logits return.
+        if capture_layer_ids is not None:
+            hidden, captured = self.model(
+                inputs, cache, input_embeddings, capture_layer_ids=capture_layer_ids
+            )
+            logits = self.logits_from_hidden(hidden)
+            return SpeculativeOutput(
+                logits=logits, hidden_states=captured, gdn_states=None
+            )
         out = self.model(inputs, cache, input_embeddings)
+        return self.logits_from_hidden(out)
+
+    def logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        """Project (already final-normed) hidden states to logits."""
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-        return out
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size: int) -> int:
+        """Rewind target KV after a speculative round (rejected tail) — plain
+        trim; gdn_states accepted (and ignored) for API parity with the mlx-vlm
+        round loop (MiniMax M3 here runs standard/sparse KV, no SSM state)."""
+        del gdn_states
+        if isinstance(accepted, (list, tuple)):
+            accepted = mx.array(accepted, dtype=mx.int32)
+        max_a = int(accepted.max().item()) if isinstance(accepted, mx.array) else int(accepted)
+        trim = block_size - (max_a + 1)
+        if trim > 0:
+            for c in caches:
+                if c is not None and hasattr(c, "trim"):
+                    c.trim(trim)
+        return max_a
 
     def sanitize(self, weights):
         """Load text-only, mlx-vlm-converted, and original VL checkpoints:

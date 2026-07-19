@@ -662,6 +662,87 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def _eagle3_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    drafter: nn.Module,
+    *,
+    max_tokens: int,
+    sampler,
+    prompt_cache,
+    prefill_step_size: int,
+    temperature,
+) -> Generator[Tuple[int, Optional[mx.array], bool], None, None]:
+    """EAGLE3 self-drafting against an mlx-lm target: chunked capture-prefill
+    (the drafter consumes the CONCATENATED aux hiddens of the whole prompt),
+    then the mlx-vlm round loop. Target contract: forward accepts
+    capture_layer_ids and returns .logits/.hidden_states, plus
+    rollback_speculative_cache (see minimax_m3)."""
+    from .spec_delegate import eagle3_capture_layer_ids, eagle3_rounds
+
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise ValueError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache "
+            "— EAGLE3 decoding needs the capture/rollback target hooks."
+        )
+    # Capture-layer ids are a property of the TARGET, not the drafter — a drafter
+    # checkpoint can't encode its target's depth (and this one's config derives a
+    # degenerate [2,0,0] from its own single layer). Use the drafter's ids only if
+    # they're a sane 3-tuple within the target; otherwise apply the EAGLE3
+    # convention [2, n//2, n-3] against the target depth ([2,30,57] for M3's 60).
+    n = len(lm.model.layers)
+    ids = eagle3_capture_layer_ids(drafter)
+    if len(set(ids)) != 3 or max(ids) >= n:
+        ids = [2, n // 2, max(n - 3, 0)]
+    # Persist onto the drafter config so the mlx-vlm round loop (which
+    # re-derives capture ids from drafter.config, not our prefill) captures the
+    # SAME 3 layers — otherwise verify concatenates a different aux width.
+    drafter.config.capture_layer_ids = list(ids)
+    drafter.config.target_layer_ids = list(ids)
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(model)
+
+    y = prompt[None] if prompt.ndim == 1 else prompt
+    prompt_tokens = y
+    hidden_chunks = []
+    while y.shape[1] > prefill_step_size:
+        out = lm(y[:, :prefill_step_size], cache=prompt_cache, capture_layer_ids=ids)
+        hidden_chunks.append(mx.concatenate(out.hidden_states, axis=-1))
+        mx.eval(hidden_chunks[-1])
+        y = y[:, prefill_step_size:]
+        mx.clear_cache()
+    out = lm(y, cache=prompt_cache, capture_layer_ids=ids)
+    hidden_chunks.append(mx.concatenate(out.hidden_states, axis=-1))
+    hidden = (
+        mx.concatenate(hidden_chunks, axis=1) if len(hidden_chunks) > 1 else hidden_chunks[0]
+    )
+
+    # First committed token straight off the prefill logits.
+    logits = out.logits[:, -1:]
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    first = sampler(logprobs)
+    mx.eval(first)
+    first_tok = int(first.reshape(-1)[0].item())
+    yield first_tok, logprobs.squeeze(0).squeeze(0), False
+
+    greedy = temperature is not None and temperature == 0
+    rounds = eagle3_rounds(
+        model,
+        drafter,
+        prompt_cache,
+        hidden,
+        prompt_tokens=prompt_tokens,
+        first_bonus=first_tok,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        greedy_sampling=greedy,
+    )
+    for tok, _ in rounds:
+        yield int(tok), None, True
+
+
 def drafter_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -697,6 +778,20 @@ def drafter_generate_step(
         )
 
     lm = model.language_model if hasattr(model, "language_model") else model
+    # EAGLE3 drafters use a different target interface (capture_layer_ids
+    # forward + rollback hook) — dispatch before the MTP-assistant hook check.
+    if type(drafter).__name__ == "Eagle3DraftModel":
+        yield from _eagle3_generate_step(
+            prompt,
+            model,
+            drafter,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            prompt_cache=prompt_cache,
+            prefill_step_size=prefill_step_size,
+            temperature=temperature,
+        )
+        return
     if not hasattr(lm, "speculative_verify_hidden"):
         raise ValueError(
             f"{type(lm).__name__} does not implement the drafter speculative "
