@@ -45,6 +45,9 @@ class ModelArgs(BaseModelArgs):
     indexer_rope_interleave: bool = True
     # GLM-5.2: per-layer "full" | "shared" DSA indexer sharing (see deepseek_v32).
     indexer_types: Optional[list] = None
+    # Baked MTP (nextn) self-speculative draft head (see deepseek_v32.Model.mtp).
+    num_nextn_predict_layers: int = 0
+    index_share_for_mtp_iteration: bool = False
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters

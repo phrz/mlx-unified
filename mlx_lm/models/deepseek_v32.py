@@ -27,6 +27,11 @@ class ModelArgs(BaseModelArgs):
     # GLM-5.2: per-layer "full" | "shared" — shared layers reuse the previous
     # full layer's DSA top-k selection and carry no indexer weights.
     indexer_types: Optional[list] = None
+    # GLM-5.2 / DeepSeek-V3: multi-token-prediction block(s) appended after the
+    # main stack (checkpoint names model.layers.{num_hidden_layers}+). Loaded as a
+    # self-speculative draft head (Model.mtp) — NOT part of the main forward.
+    num_nextn_predict_layers: int = 0
+    index_share_for_mtp_iteration: bool = False
     intermediate_size: int = 11008
     moe_intermediate_size: int = 1407
     num_hidden_layers: int = 30
@@ -170,10 +175,14 @@ class DeepseekV32Attention(nn.Module):
                     self.scale = self.scale * s * s
 
         # GLM-5.2 cross-layer top-k sharing: "shared" layers carry no indexer
-        # weights and reuse the previous "full" layer's token selection.
+        # weights and reuse the previous "full" layer's token selection. A
+        # layer_idx past the list (the MTP head at num_hidden_layers) ships its
+        # own full indexer, so it's treated as "full".
         indexer_types = getattr(config, "indexer_types", None)
         self.skip_topk = (
-            indexer_types is not None and indexer_types[layer_idx] == "shared"
+            indexer_types is not None
+            and layer_idx < len(indexer_types)
+            and indexer_types[layer_idx] == "shared"
         )
         self.indexer = None if self.skip_topk else Indexer(config)
         self.rope = initialize_rope(
@@ -423,6 +432,32 @@ class DeepseekV32DecoderLayer(nn.Module):
         return h + r, topk_indices
 
 
+class SharedHead(nn.Module):
+    """The MTP head's pre-logits norm (checkpoint child: shared_head.norm)."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
+class DeepseekV32MTPHead(DeepseekV32DecoderLayer):
+    """GLM-5.2 / DeepSeek-V3 baked multi-token-prediction head: ONE extra decoder
+    layer (checkpoint model.layers.{num_hidden_layers} — structurally identical to
+    a main layer, absorbed-MLA attention + its own full indexer + MoE) plus the
+    MTP couplings: h' = eh_proj([enorm(embed(next_tok)) ; hnorm(h)]) fed through
+    the layer, logits = lm_head(shared_head.norm(out)). Subclassing the decoder
+    layer keeps the child names (input_layernorm/self_attn/mlp/…) aligned with the
+    checkpoint so sanitize() only has to remap the layer-index prefix."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__(config, layer_idx=config.num_hidden_layers)
+        dims = config.hidden_size
+        self.enorm = nn.RMSNorm(dims, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(dims, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * dims, dims, bias=False)
+        self.shared_head = SharedHead(config)
+
+
 class DeepseekV32Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -502,6 +537,15 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.model = DeepseekV32Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Baked MTP (nextn) self-speculative draft head — separate from
+        # model.layers so the main forward, make_cache, and pipeline sharding
+        # are untouched. The draft loop drives it explicitly (mtp_draft_step)
+        # with its OWN cache.
+        self.mtp = (
+            DeepseekV32MTPHead(config)
+            if getattr(config, "num_nextn_predict_layers", 0) > 0
+            else None
+        )
 
     def __call__(
         self,
@@ -511,13 +555,44 @@ class Model(nn.Module):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
+    def make_mtp_cache(self):
+        """A fresh KV cache for the MTP head (main KV + its indexer KV)."""
+        return CacheList(KVCache(), KVCache())
+
+    def mtp_draft_step(self, token: mx.array, hidden: mx.array, cache=None):
+        """One greedy draft step of the baked MTP head (DeepSeek-V3 recurrence):
+
+            h' = eh_proj([enorm(embed(token)) ; hnorm(hidden)])
+            out = mtp_layer(h', cache)          # its own KV, position = cache offset
+            logits = lm_head(shared_head.norm(out))
+
+        `token` is the NEXT token (1, 1) already produced at this position and
+        `hidden` (1, 1, D) the hidden that produced it — the model's final-NORMED
+        output for the seed step (model.model() returns norm(h)), or this method's
+        returned `out` when chaining draft steps. Predicts the token AFTER `token`.
+        Returns (logits (1, 1, V), out (1, 1, D)).
+        """
+        mtp = self.mtp
+        x = mtp.enorm(self.model.embed_tokens(token))
+        h = mtp.hnorm(hidden)
+        hx = mtp.eh_proj(mx.concatenate([x, h], axis=-1))
+        out, _ = mtp(hx, None, cache)  # plain DecoderLayer forward (not overridden)
+        return self.lm_head(mtp.shared_head.norm(out)), out
+
     def sanitize(self, weights):
-        # Remove multi-token prediction layers
+        # Multi-token-prediction layers live past the main stack as
+        # model.layers.{num_hidden_layers}+. When the MTP head is enabled, remap
+        # the FIRST one onto the mtp module (child names match a decoder layer,
+        # so only the prefix changes); anything else (or all of them, with the
+        # head disabled) is dropped as before. v1 drafts with a single MTP block
+        # even if the checkpoint ships more (num_nextn_predict_layers > 1).
         mpt_layer = self.args.num_hidden_layers
         new_weights = {}
         for k, v in weights.items():
             parts = k.split(".")
             if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
+                if self.mtp is not None and int(parts[2]) == mpt_layer:
+                    new_weights["mtp." + ".".join(parts[3:])] = v
                 continue
             new_weights[k] = v
         weights = new_weights
@@ -551,9 +626,13 @@ class Model(nn.Module):
                 new_weights[k] = v
         weights = new_weights
 
-        # Stack experts
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
+        # Stack experts (the remapped MTP block gets the same treatment — an fp8
+        # original ships its experts unstacked and its MLA unabsorbed too)
+        prefixes = [f"model.layers.{l}" for l in range(self.args.num_hidden_layers)]
+        if self.mtp is not None:
+            prefixes.append("mtp")
+        for base in prefixes:
+            prefix = base
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
@@ -562,9 +641,8 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-            prefix = f"model.layers.{l}.self_attn"
+            prefix = f"{base}.self_attn"
             if f"{prefix}.kv_b_proj.weight" in weights:
-                layer = self.model.layers[l].self_attn.embed_q
                 quantized = f"{prefix}.kv_b_proj.scales" in weights
                 v = weights.pop(f"{prefix}.kv_b_proj.weight")
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
