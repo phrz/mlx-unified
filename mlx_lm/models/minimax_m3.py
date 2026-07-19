@@ -1057,6 +1057,60 @@ class Model(nn.Module):
         )
         num_experts = self.args.num_local_experts
 
+        # mlx quants made from the UNFUSED module tree (separate switch_mlp
+        # gate_proj/up_proj + a standalone shared expert — e.g. pipenetwork's
+        # mixed-bit M3) already ship stacked tensors matching the unpacked
+        # branch. Rebuild the MoE blocks unpacked so the module tree matches the
+        # checkpoint — plain SwitchGLU is also the layout the expert-streaming
+        # delegate knows how to stream.
+        # Checkpoints exported WITHOUT the MSA indexer weights (e.g. pipenetwork's
+        # mixed-bit quant ships no self_attn.index_*): fall back to DENSE attention
+        # — the exact form the sparse indexer approximates — by clearing the
+        # per-instance sparse flag (the forward and make_cache both read it) and
+        # dropping the index modules so strict load_weights doesn't demand them.
+        if not any(k.endswith("self_attn.index_q_proj.weight") for k in weights):
+            for layer in self.model.layers:
+                attn = getattr(layer, "self_attn", None)
+                if attn is None or not getattr(attn, "has_sparse_index", False):
+                    continue
+                attn.has_sparse_index = False
+                attn.indexer = None
+                for name in (
+                    "index_q_proj",
+                    "index_k_proj",
+                    "index_q_norm",
+                    "index_k_norm",
+                ):
+                    if hasattr(attn, name):
+                        delattr(attn, name)
+
+        unfused = any(
+            k.endswith("block_sparse_moe.switch_mlp.gate_proj.weight") for k in weights
+        )
+        if unfused and pack_shared:
+            pack_shared = False
+            activation = MiniMaxSwiGLUOAI(
+                self.args.swiglu_alpha, self.args.swiglu_limit, self.args.swiglu_beta
+            )
+            for layer in self.model.layers:
+                moe = getattr(layer, "block_sparse_moe", None)
+                if moe is None or not getattr(moe, "pack_shared_expert", False):
+                    continue
+                moe.pack_shared_expert = False
+                moe.switch_mlp = SwitchGLU(
+                    self.args.hidden_size,
+                    self.args.intermediate_size,
+                    num_experts,
+                    activation=activation,
+                )
+                moe.shared_experts = MiniMaxMLP(
+                    self.args.hidden_size,
+                    self.args.shared_intermediate_size,
+                    self.args.swiglu_alpha,
+                    self.args.swiglu_limit,
+                    self.args.swiglu_beta,
+                )
+
         def expert_keys(prefix, name, suffix):
             return [
                 f"{prefix}.experts.{expert}.{name}.{suffix}"
