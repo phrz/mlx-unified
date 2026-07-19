@@ -393,13 +393,32 @@ def load_model(
         weights = model.sanitize(weights)
 
     def _quantize(quantization):
+        default_bits = quantization["bits"]
+        default_gs = quantization["group_size"]
+        mode = quantization.get("mode", "affine")
+
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            # A quantized module with NO per-module annotation (e.g. GLM-5.2's
+            # MTP block — quantizers only annotate model.layers.*): infer bits/
+            # group_size from the packed shapes rather than assume the default,
+            # which would shape-mismatch on a mixed-precision checkpoint.
+            if mode == "affine" and hasattr(m, "weight"):
+                in_dims = m.weight.shape[-1]
+                packed = weights[f"{p}.weight"].shape[-1]
+                n_groups = weights[f"{p}.scales"].shape[-1]
+                if in_dims > 0 and packed > 0 and n_groups > 0:
+                    bits = (packed * 32) // in_dims
+                    group_size = in_dims // n_groups
+                    if (bits, group_size) != (default_bits, default_gs):
+                        return {"bits": bits, "group_size": group_size}
+            return True
 
         nn.quantize(
             model,
