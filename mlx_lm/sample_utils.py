@@ -77,6 +77,11 @@ def make_logits_processors(
     presence_context_size: Optional[int] = 20,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = 20,
+    dry_multiplier: Optional[float] = None,
+    dry_base: float = 1.75,
+    dry_allowed_length: int = 2,
+    dry_penalty_last_n: int = 0,
+    dry_sequence_breaker_ids: Optional[List[int]] = None,
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -122,6 +127,17 @@ def make_logits_processors(
     for make_penalty, penalty, context_size in repetition_penalties:
         if penalty is not None and penalty != 0:
             logits_processors.append(make_penalty(penalty, context_size))
+
+    if dry_multiplier is not None and dry_multiplier > 0:
+        logits_processors.append(
+            make_dry_penalty(
+                dry_multiplier,
+                dry_base,
+                dry_allowed_length,
+                dry_penalty_last_n,
+                dry_sequence_breaker_ids,
+            )
+        )
 
     return logits_processors
 
@@ -365,3 +381,101 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return frequency_penalty_processor
+
+
+def make_dry_penalty(
+    multiplier: float,
+    base: float = 1.75,
+    allowed_length: int = 2,
+    penalty_last_n: int = 0,
+    sequence_breaker_ids: Optional[List[int]] = None,
+):
+    """
+    Make a DRY (Don't Repeat Yourself) n-gram repetition penalty processor.
+
+    Unlike token-level penalties, DRY targets verbatim SEQUENCE repetition:
+    if generating token ``y`` would extend a sequence that already occurred
+    earlier in the context (an n-gram match of length ``L >= allowed_length``
+    ending at the current position), ``y``'s logit is reduced by
+    ``multiplier * base ** (L - allowed_length)`` — the penalty grows
+    exponentially with the length of the loop being reproduced, so short
+    incidental echoes are cheap and long loops become impossible.
+
+    From p-e-w's DRY sampler (oobabooga/text-generation-webui#5677), matching
+    llama.cpp's ``dry_*`` request-field semantics.
+
+    Args:
+        multiplier (float): Penalty strength; 0 disables. Typical: ``0.8``.
+        base (float): Exponential growth per extra matched token. Typical
+            ``1.75``.
+        allowed_length (int): Longest verbatim repeat that goes unpenalized.
+            Typical ``2``.
+        penalty_last_n (int): How many trailing context tokens to scan for
+            matches. ``0`` (or negative) scans the whole context.
+        sequence_breaker_ids (List[int], optional): Token ids across which
+            matches may not extend (typically newline/punctuation), so
+            structural tokens don't count as "repetition".
+
+    Returns:
+        Callable[[mx.array, mx.array], mx.array]
+    """
+    if multiplier < 0:
+        raise ValueError(f"multiplier must be non-negative, got {multiplier}")
+    if base <= 1.0:
+        raise ValueError(f"base must be > 1, got {base}")
+    allowed_length = max(1, int(allowed_length))
+    breakers = frozenset(sequence_breaker_ids or [])
+    # Bound the per-step work: matches longer than this are penalized as if
+    # MAX_MATCH long (base**(50-2) is already astronomically prohibitive), and
+    # only the most recent occurrences of the trigger token are examined.
+    MAX_MATCH = 50
+    MAX_OCCURRENCES = 64
+
+    # Incremental closure state — a processor instance is per-request/-stream,
+    # called with the full (prompt + generated) token history each step.
+    toks: List[int] = []
+    occurrences: Dict[int, List[int]] = {}
+
+    def dry_processor(tokens, logits):
+        n = len(tokens)
+        if n < 2:
+            return logits
+        # Absorb tokens we haven't indexed yet (prompt on first call, then +1/step).
+        while len(toks) < n:
+            i = len(toks)
+            t = int(tokens[i])
+            toks.append(t)
+            occurrences.setdefault(t, []).append(i)
+
+        last = toks[-1]
+        if last in breakers:
+            return logits
+        start = 0 if penalty_last_n <= 0 else max(0, n - penalty_last_n)
+        # best penalized-match length per candidate next token
+        best: Dict[int, int] = {}
+        for i in reversed(occurrences.get(last, [])[-MAX_OCCURRENCES:]):
+            if i >= n - 1 or i < start:
+                continue
+            # Walk the common suffix ending at i and at n-1.
+            length = 1
+            while (
+                length < MAX_MATCH
+                and i - length >= start
+                and toks[i - length] == toks[n - 1 - length]
+                and toks[i - length] not in breakers
+            ):
+                length += 1
+            if length >= allowed_length:
+                y = toks[i + 1]
+                if y not in breakers and best.get(y, 0) < length:
+                    best[y] = length
+        if best:
+            ids = mx.array(list(best.keys()))
+            penalties = mx.array(
+                [multiplier * base ** (L - allowed_length) for L in best.values()],
+                dtype=logits.dtype,
+            )
+            logits = logits.at[:, ids].subtract(penalties)
+        return logits
+
+    return dry_processor

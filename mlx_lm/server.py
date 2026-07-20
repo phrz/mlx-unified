@@ -228,6 +228,13 @@ class LogitsProcessorArguments:
     presence_context_size: int
     frequency_penalty: float
     frequency_context_size: int
+    # DRY n-gram penalty (llama.cpp-compatible request fields). Breakers are
+    # kept as STRINGS here; _make_logits_processors tokenizes them.
+    dry_multiplier: float = 0.0
+    dry_base: float = 1.75
+    dry_allowed_length: int = 2
+    dry_penalty_last_n: int = 0
+    dry_sequence_breakers: Optional[List[str]] = None
 
 
 @dataclass
@@ -579,7 +586,21 @@ def _make_sampler(args, tokenizer):
     )
 
 
-def _make_logits_processors(args):
+def _dry_breaker_ids(tokenizer, breakers: Optional[List[str]]) -> Optional[List[int]]:
+    """Tokenize DRY sequence-breaker strings into a flat id list. Every id from
+    each encode is included (SP tokenizers may split a breaker into several)."""
+    if tokenizer is None or not breakers:
+        return None
+    ids: List[int] = []
+    for s in breakers:
+        try:
+            ids.extend(tokenizer.encode(s, add_special_tokens=False))
+        except TypeError:
+            ids.extend(tokenizer.encode(s))
+    return ids or None
+
+
+def _make_logits_processors(args, tokenizer=None):
     return make_logits_processors(
         args.logits.logit_bias,
         args.logits.repetition_penalty,
@@ -588,6 +609,13 @@ def _make_logits_processors(args):
         args.logits.presence_context_size,
         args.logits.frequency_penalty,
         args.logits.frequency_context_size,
+        dry_multiplier=args.logits.dry_multiplier,
+        dry_base=args.logits.dry_base,
+        dry_allowed_length=args.logits.dry_allowed_length,
+        dry_penalty_last_n=args.logits.dry_penalty_last_n,
+        dry_sequence_breaker_ids=_dry_breaker_ids(
+            tokenizer, args.logits.dry_sequence_breakers
+        ),
     )
 
 
@@ -1029,7 +1057,7 @@ class ResponseGenerator:
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[_make_logits_processors(args, tokenizer)],
                         state_machines=[sm],
                     )
                     batch_results[uid] = {
@@ -1231,7 +1259,7 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _make_logits_processors(args, tokenizer)
 
             # mlx-unified: multimodal requests get their OWN cache namespace, keyed by
             # every image referenced so far in the conversation (order-sensitive) —
@@ -1922,6 +1950,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.presence_context_size = self.body.get("presence_context_size", 20)
         self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
         self.frequency_context_size = self.body.get("frequency_context_size", 20)
+        # DRY n-gram penalty — llama.cpp-compatible field names/defaults.
+        self.dry_multiplier = self.body.get("dry_multiplier", 0.0)
+        self.dry_base = self.body.get("dry_base", 1.75)
+        self.dry_allowed_length = self.body.get("dry_allowed_length", 2)
+        self.dry_penalty_last_n = self.body.get("dry_penalty_last_n", 0)
+        self.dry_sequence_breakers = self.body.get(
+            "dry_sequence_breakers", ["\n", ":", "\"", "*"]
+        )
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
@@ -1984,6 +2020,11 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("presence_context_size", int, min_val=0)
         self._validate("frequency_penalty", (float, int))
         self._validate("frequency_context_size", int, min_val=0)
+        self._validate("dry_multiplier", (float, int), min_val=0)
+        self._validate("dry_base", (float, int), min_val=1)
+        self._validate("dry_allowed_length", int, min_val=1)
+        self._validate("dry_penalty_last_n", int, min_val=-1)
+        self._validate("dry_sequence_breakers", list, optional=True)
         self._validate("logprobs", bool)
         self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
         self._validate("xtc_probability", float, min_val=0, max_val=1)
@@ -2139,6 +2180,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 presence_context_size=self.presence_context_size,
                 frequency_penalty=self.frequency_penalty,
                 frequency_context_size=self.frequency_context_size,
+                dry_multiplier=self.dry_multiplier,
+                dry_base=self.dry_base,
+                dry_allowed_length=self.dry_allowed_length,
+                dry_penalty_last_n=self.dry_penalty_last_n,
+                dry_sequence_breakers=self.dry_sequence_breakers,
             ),
             stop_words=stop_words,
             max_tokens=self.max_tokens,
