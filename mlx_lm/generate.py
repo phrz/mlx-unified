@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import logging
 import os
 import sys
 import time
@@ -911,6 +912,23 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     draft_kind = kwargs.pop("draft_kind", None)
+    # Drafter-family round loops (MTP/EAGLE3) can't thread sequential logits
+    # processors through their batched draft+verify forwards. Rather than
+    # erroring the request, drop the drafter for THIS generation and decode
+    # plainly — sampling correctness wins over speculative speed.
+    if (
+        draft_model is not None
+        and draft_kind is not None
+        and kwargs.get("logits_processors")
+    ):
+        logging.warning(
+            "logits processors requested on a %s-drafter model — bypassing "
+            "speculative decoding for this request (penalties apply, no drafter "
+            "speedup).",
+            draft_kind,
+        )
+        draft_model = None
+        draft_kind = None
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)

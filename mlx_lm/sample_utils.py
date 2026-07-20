@@ -440,6 +440,12 @@ def make_dry_penalty(
         n = len(tokens)
         if n < 2:
             return logits
+        # Guard the incremental index against a non-monotone history (a caller
+        # that rewinds/branches, e.g. a speculative rollback): if the history
+        # got shorter or its tail no longer matches what we indexed, rebuild.
+        if len(toks) > n or (toks and int(tokens[len(toks) - 1]) != toks[-1]):
+            toks.clear()
+            occurrences.clear()
         # Absorb tokens we haven't indexed yet (prompt on first call, then +1/step).
         while len(toks) < n:
             i = len(toks)
