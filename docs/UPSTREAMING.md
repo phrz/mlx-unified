@@ -27,6 +27,18 @@ Already superseded upstream (nothing to send):
 - transformers ≥5.13 `AutoTokenizer.register` breakage — upstream fixed via the
   config-class form (#1465); we adopted their form in `c2dd4e3`.
 
+## ml-explore/mlx
+
+| Change | Our commits (local clone ~/Repos/mlx, branch qmv-poc off v0.32.0) | Status | Notes |
+|---|---|---|---|
+| 3-bit qmv fast path: three aligned uint16 loads instead of six byte loads in the qdot inner loop (same mask-only + pre-scaled-x trick, wider words; v5/v10 word-straddles fold back with the *65536 term). vpt=8 kernels and safe tails untouched | `a72a9e85` | pending | Proven e2e on MiniMax-M3 3_6bit: 27.5 → 28.0 tok/s (+2%, non-overlapping 4-rep ranges); short-chain latency −15%/4-layer gather chain; numerics 3× tighter (fewer pre-scale divisions). Negative result worth carrying too: a shift-composite variant regressed 17% — serialized extraction loses the masked-FMA ILP. GitHub fork not created yet (gh token lacks scope); local-only. |
+
+Also measured, no change to carry: batch=1 quantized gemv marginal BW is ~630-720 GB/s
+(77-88% of the M3 Ultra's 819 GB/s) across bits — the "3-bit is slow" appearance in naive
+per-call benchmarks is a ~200µs per-eval sync floor, not kernel inefficiency. The dependent-chain
+decode regime runs ~500 GB/s (latency exposure between chained kernels), which is where the
+remaining headroom lives — a scheduling/overlap question, not an unpack one.
+
 ## Blaizzy/mlx-vlm
 
 | Change | Our commits (phrz/mlx-vlm@draft-blocks) | Status | Notes |
