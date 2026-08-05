@@ -437,6 +437,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        skip_final_norm: bool = False,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -486,7 +487,8 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return self.norm(hidden_states)
+        # Speculative-decoding hooks need the pre-norm hidden (they norm on demand).
+        return hidden_states if skip_final_norm else self.norm(hidden_states)
 
 
 class TextModel(nn.Module):
@@ -517,6 +519,67 @@ class TextModel(nn.Module):
 
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+
+    # ---- Drafter-family speculative-decoding hooks (mlx-vlm MTP contract) -----
+    # qwen3.5/3.6 is a hybrid model: GatedDeltaNet (linear-attn, recurrent
+    # conv/ssm state in ArraysCache) interleaved with gated-attention (KVCache).
+    # Unlike gemma4 (KV-only), a rejected draft tail must rewind the GatedDeltaNet
+    # recurrent state, not just trim KV. rollback_speculative_cache does this by
+    # trimming the whole verify block from every cache, restoring each linear
+    # layer's pre-block conv/ssm snapshot, then re-running the accepted prefix in
+    # one forward — which re-advances KV and GDN state together, exactly.
+
+    def logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return self.logits_from_hidden(self.model.norm(hidden))
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return self.model.norm(hidden)
+
+    def speculative_verify_hidden(self, verify_input, prompt_cache):
+        """One target forward over the verify block → (pre-norm hidden, {}).
+
+        Returns a 2-tuple like gemma4 (the qwen MTP drafter ignores shared_kv).
+        The GatedDeltaNet rollback point — each linear layer's pre-block conv/ssm
+        recurrent state, plus the block tokens — is stashed on ``self`` for
+        rollback_speculative_cache, rather than threaded through the tuple (the
+        prefill caller unpacks exactly two)."""
+        self._gdn_snapshot = [
+            (c, list(c.state), c.lengths)
+            for layer, c in zip(self.model.layers, prompt_cache)
+            if getattr(layer, "is_linear", False) and c is not None
+        ]
+        self._spec_verify_input = verify_input
+        hidden = self.model(verify_input, cache=prompt_cache, skip_final_norm=True)
+        return hidden, {}
+
+    def rollback_speculative_cache(
+        self, caches, gdn_states, accepted, block_size
+    ) -> int:
+        del gdn_states  # we use the snapshot stashed by speculative_verify_hidden
+        keep = int(accepted) + 1
+        # Attention layers: drop the whole block (offset-aware trim; the re-run
+        # below overwrites exactly `keep` from the pre-block offset).
+        for layer, c in zip(self.model.layers, caches):
+            if (
+                c is not None
+                and not getattr(layer, "is_linear", False)
+                and getattr(c, "is_trimmable", lambda: False)()
+            ):
+                c.trim(block_size)
+        # GatedDeltaNet layers: restore the pre-block conv/ssm recurrent state.
+        for c, state_snap, lengths_snap in getattr(self, "_gdn_snapshot", []):
+            c.state = list(state_snap)
+            c.lengths = lengths_snap
+        # Re-advance every cache by exactly the accepted prefix in one forward.
+        vin = getattr(self, "_spec_verify_input", None)
+        if keep > 0 and vin is not None:
+            self.model(vin[:, :keep], cache=caches, skip_final_norm=True)
+        return int(accepted)
 
     def sanitize(self, weights):
         has_mtp_weights = any("mtp." in k for k in weights)
