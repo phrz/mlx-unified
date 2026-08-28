@@ -18,8 +18,11 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
+from .models import cache
 from .models.cache import (
+    BatchRotatingKVCache,
     QuantizedKVCache,
+    RotatingKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
     load_prompt_cache,

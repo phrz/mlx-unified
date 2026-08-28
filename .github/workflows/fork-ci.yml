@@ -35,8 +35,8 @@ jobs:
           python-version: "3.11"
 
       - name: Install package with test + vision extras
-        # The vision extra is mlx-vlm + Pillow with the fork's known-good
-        # transformers pin (>=5.7.0,<5.13.0 — 5.13 broke AutoTokenizer.register).
+        # The vision extra follows the mlx-vlm fork's current main and its
+        # Transformers >=5.14 processor contract.
         run: |
           python -m pip install --upgrade pip
           pip install ".[test,vision]"

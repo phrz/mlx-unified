@@ -36,7 +36,7 @@ def ngram_propose(
     *,
     max_draft: int,
     max_ngram: int = 5,
-    min_ngram: int = 3,
+    min_ngram: int = 2,
 ) -> List[int]:
     """Propose up to max_draft continuation tokens by finding the most recent
     earlier occurrence of the context's current suffix n-gram (longest n first)
