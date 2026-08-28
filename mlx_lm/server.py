@@ -10,8 +10,7 @@ import socket
 import time
 import uuid
 import warnings
-from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -37,13 +36,13 @@ from ._version import __version__
 from .diffusion_generate import is_diffusion_model, stream_diffusion_generate
 from .generate import (
     BatchGenerator,
-    SequenceStateMachine,
+    StopSequenceMatcher,
+    TextStateMachine,
+    make_stop_matcher,
+    make_text_state_machine,
     stream_generate,
 )
-from .models.cache import (
-    LRUPromptCache,
-    make_prompt_cache,
-)
+from .models.cache import LRUPromptCache, make_prompt_cache
 from .multimodal import (
     extract_image_points,
     images_from_message_content,
@@ -289,7 +288,8 @@ class GenerationContext:
     has_thinking: bool
     tool_parser: Callable[[str, Any], Dict]
 
-    sequences: Dict[Tuple[int], str]
+    text_sm: TextStateMachine
+    initial_state: str
 
     prompt: List[int]
     prompt_cache_count: int = -1
@@ -304,30 +304,12 @@ class GenerationContext:
 class Response:
     text: str
     token: int
-    state: str
-    match: Tuple[int]
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
     # mlx-unified: opt-in diffusion draft (delegated VLMs) — carries only the
     # in-progress blocks' text; excluded from all token/usage accounting.
     draft_blocks: Optional[List[str]] = None
-
-
-def _process_control_tokens(ctx, token_stream):
-    buffer_size = max(len(s) for s in ctx.sequences)
-    buffered_stream = deque()
-
-    for tok in token_stream:
-        buffered_stream.append(tok)
-        if tok.match is not None:
-            popped = [buffered_stream.pop() for _ in tok.match]
-            for t in reversed(popped):
-                buffered_stream.append(replace(t, text=""))
-        if len(buffered_stream) >= buffer_size:
-            yield buffered_stream.popleft()
-    while len(buffered_stream) > 0:
-        yield buffered_stream.popleft()
 
 
 class TimeBudget:
@@ -560,8 +542,8 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self._model_map.get(model_path, model_path)
         adapter_path = self._adapter_map.get(model_path, adapter_path)
+        model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
@@ -579,10 +561,7 @@ def _make_sampler(args, tokenizer):
         min_p=args.sampling.min_p,
         xtc_probability=args.sampling.xtc_probability,
         xtc_threshold=args.sampling.xtc_threshold,
-        xtc_special_tokens=[
-            tokenizer.eos_token_id,
-            tokenizer.encode("\n"),
-        ],
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
 
 
@@ -888,64 +867,21 @@ class ResponseGenerator:
 
         return prompt, segments, segment_types, initial_state
 
-    def _make_state_machine(
-        self, model_key, tokenizer, stop_words, initial_state="normal"
-    ):
-        """Make a new SequenceStateMachine or fetch it if we 've made it before.
-
-        Return also a dictionary that maps the token sequences in the state
-        machine to their strings.
-        """
-        cache_key = (model_key, tuple(stop_words), initial_state)
+    def _make_state_machine(self, model_key, tokenizer, stop_words):
+        """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
+        cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
-        # Will hold the state machine transitions and the sequences map to
-        # strings.
-        transitions = {}
-        sequences = {}
+        stop_matcher = make_stop_matcher(tokenizer, stop_words)
+        text_sm = make_text_state_machine(tokenizer, stop_words)
 
-        # Add all the stop sequences
-        common_stops = []
-        for t in tokenizer.eos_token_ids:
-            sequences[(t,)] = tokenizer.convert_ids_to_tokens(t)
-            common_stops.append(((t,), None))
-        for w in stop_words:
-            t = tuple(tokenizer.encode(w, add_special_tokens=False))
-            sequences[t] = w
-            common_stops.append((t, None))
-
-        # From normal to stop
-        transitions["normal"] = list(common_stops)
-
-        # Reasoning related transitions
-        if tokenizer.has_thinking:
-            ts = tokenizer.think_start_tokens
-            te = tokenizer.think_end_tokens
-            transitions["normal"].append((ts, "reasoning"))
-            transitions["reasoning"] = [(te, "normal")]
-            transitions["reasoning"].extend(common_stops)
-            sequences[ts] = tokenizer.think_start
-            sequences[te] = tokenizer.think_end
-
-        # Tool calling relating transitions
-        if tokenizer.has_tool_calling:
-            ts = tokenizer.tool_call_start_tokens
-            te = tokenizer.tool_call_end_tokens
-            transitions["normal"].append((ts, "tool"))
-            transitions["tool"] = [(te, "normal")] if te else []
-            transitions["tool"].extend(common_stops)
-            sequences[ts] = tokenizer.tool_call_start
-            if te:
-                sequences[te] = tokenizer.tool_call_end
-
-        sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (sm, sequences)
+        self._state_machine_cache[cache_key] = (stop_matcher, text_sm)
 
-        return sm, sequences
+        return stop_matcher, text_sm
 
     def _is_batchable(self, request, args):
         # Image requests take the sequential path: BatchGenerator has no
@@ -1020,11 +956,10 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    sm, sequences = self._make_state_machine(
+                    stop_matcher, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
                         tokenizer,
                         args.stop_words,
-                        initial_state,
                     )
 
                     self._log_cache_stats()
@@ -1045,7 +980,8 @@ class ResponseGenerator:
                         has_tool_calling=tokenizer.has_tool_calling,
                         has_thinking=tokenizer.has_thinking,
                         tool_parser=tokenizer.tool_parser,
-                        sequences=sequences,
+                        text_sm=text_sm,
+                        initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
                     )
@@ -1058,7 +994,7 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args, tokenizer)],
-                        state_machines=[sm],
+                        stop_matchers=[stop_matcher],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -1159,13 +1095,23 @@ class ResponseGenerator:
 
                     for r in gen_responses:
                         result = batch_results[r.uid]
-                        result["detokenizer"].add_token(r.token)
+
+                        # Don't decode the final stop token
+                        if r.finish_reason == "stop":
+                            result["detokenizer"].finalize()
+                            text = result["detokenizer"].last_segment
+                        elif r.finish_reason == "length":
+                            result["detokenizer"].add_token(r.token)
+                            result["detokenizer"].finalize()
+                            text = result["detokenizer"].last_segment
+                        else:
+                            result["detokenizer"].add_token(r.token)
+                            text = result["detokenizer"].last_segment
+
                         result["rqueue"].put(
                             Response(
-                                result["detokenizer"].last_segment,
+                                text,
                                 r.token,
-                                r.current_state,
-                                r.match_sequence,
                                 r.logprobs[r.token].item(),
                                 r.finish_reason,
                                 _format_top_logprobs(
@@ -1210,14 +1156,16 @@ class ResponseGenerator:
             tokenizer = self.model_provider.tokenizer
             # x_speculative=false: run THIS request undrafted (A/B benchmarking).
             draft_model = (
-                self.model_provider.draft_model if args.speculative else None
+                self.model_provider.draft_model
+                if getattr(args, "speculative", True)
+                else None
             )
 
             # mlx-unified: delegated VLM families are rendered, tokenized and
             # generated wholesale by mlx-vlm — route before any of mlx_lm's
             # tokenizer machinery, which their processors don't implement.
             if getattr(self.model_provider, "delegate", None) is not None:
-                self._serve_delegated_diffusion(rqueue, request, args)
+                self._serve_delegated_vlm(rqueue, request, args)
                 return
 
             # mlx-unified: streamed-expert models generate through mlx-moe's own
@@ -1228,20 +1176,19 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            sm, sequences = self._make_state_machine(
+            stop_matcher, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
-                initial_state=initial_state,
             )
-            sm_state = sm.make_state()
 
             # Start the generation context
             ctx = GenerationContext(
                 has_thinking=tokenizer.has_thinking,
                 has_tool_calling=tokenizer.has_tool_calling,
                 tool_parser=tokenizer.tool_parser,
-                sequences=sequences,
+                text_sm=text_sm,
+                initial_state=initial_state,
                 prompt=prompt,
             )
             rqueue.put(ctx)
@@ -1411,6 +1358,7 @@ class ResponseGenerator:
                 generate_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
 
             # Process the prompt and generate tokens
+            stop_state = stop_matcher.make_state()
             for gen in stream_generate(
                 model=model,
                 tokenizer=gen_tokenizer,
@@ -1420,15 +1368,19 @@ class ResponseGenerator:
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
-                draft_kind=self.model_provider.draft_kind,
+                draft_kind=getattr(self.model_provider, "draft_kind", None),
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=prefill_step_size,
                 **generate_kwargs,
             ):
                 finish_reason = gen.finish_reason
-                sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
-                if match_sequence is not None and current_state is None:
+
+                # Token-level stop word detection
+                stop_state, matched = StopSequenceMatcher.match(
+                    stop_state, stop_matcher._trie, gen.token
+                )
+                if matched:
                     finish_reason = "stop"
                 if point_text is not None:
                     point_text += gen.text
@@ -1436,8 +1388,6 @@ class ResponseGenerator:
                     Response(
                         gen.text,
                         gen.token,
-                        current_state,
-                        match_sequence,
                         # Drafter-family rounds commit tokens without full-vocab
                         # logprob tensors (that's the speedup) — 0.0 stands in.
                         (
@@ -1475,9 +1425,7 @@ class ResponseGenerator:
                     extract_image_points(point_text, vision.pointing_metadata)
                 )
                 if rendered and not ctx._should_stop:
-                    rqueue.put(
-                        Response(rendered, gen.token, "normal", None, 0.0, None, ())
-                    )
+                    rqueue.put(Response(rendered, gen.token, 0.0, None, ()))
 
             rqueue.put(None)
 
@@ -1547,8 +1495,6 @@ class ResponseGenerator:
                 Response(
                     block_text if flush else "",
                     gen.token,
-                    "normal",
-                    None,
                     gen.logprob,
                     finish_reason,
                     (),
@@ -1576,15 +1522,19 @@ class ResponseGenerator:
         executor = self.model_provider.moe_executor
         tokenizer = self.model_provider.tokenizer
 
-        prompt, _, _, _initial_state = self._tokenize(tokenizer, request, args)
+        prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+        _, text_sm = self._make_state_machine(
+            self.model_provider.model_key,
+            tokenizer,
+            args.stop_words,
+        )
 
         ctx = GenerationContext(
-            has_tool_calling=False,
-            has_thinking=False,
-            tool_parser=None,
-            # Dummy length-1 sequence: passes responses straight through in order
-            # (same trick as the diffusion delegate).
-            sequences={(0,): ""},
+            has_tool_calling=tokenizer.has_tool_calling,
+            has_thinking=tokenizer.has_thinking,
+            tool_parser=tokenizer.tool_parser,
+            text_sm=text_sm,
+            initial_state=initial_state,
             prompt=list(prompt),
         )
         rqueue.put(ctx)
@@ -1645,7 +1595,7 @@ class ResponseGenerator:
                 for t in toks:
                     detok.add_token(t)
                     rqueue.put(
-                        Response(detok.last_segment, t, "normal", None, 0.0, None, ())
+                        Response(detok.last_segment, t, 0.0, None, ())
                     )
 
             out, stats = mtp_speculative_generate(
@@ -1662,7 +1612,13 @@ class ResponseGenerator:
             detok.finalize()
             finish = "stop" if out and out[-1] in eos else "length"
             rqueue.put(
-                Response(detok.last_segment, out[-1] if out else 0, "normal", None, 0.0, finish, ())
+                Response(
+                    detok.last_segment,
+                    out[-1] if out else 0,
+                    0.0,
+                    finish,
+                    (),
+                )
             )
             rqueue.put(None)
             logging.info(
@@ -1678,8 +1634,6 @@ class ResponseGenerator:
                     Response(
                         resp.text,
                         resp.token,
-                        "normal",
-                        None,
                         0.0,
                         resp.finish_reason,
                         (),
@@ -1689,17 +1643,13 @@ class ResponseGenerator:
 
         executor.submit(consume_mtp if use_mtp else consume).result()
 
-    def _serve_delegated_diffusion(self, rqueue, request, args):
+    def _serve_delegated_vlm(self, rqueue, request, args):
         """Serve one request from a delegated VLM family (mlx-unified).
 
-        Prompt rendering, image preprocessing and the denoising loop all run
-        inside mlx-vlm (see vlm_delegate), so behavior — prompts included —
-        matches the pinned mlx_vlm.server. This method only adapts the wire:
-        per-token Responses with text carried on block boundaries (exactly as
-        _serve_diffusion, textual stop-word matching included), plus opt-in
-        draft Responses that handle_completion serializes as
-        delta.x_draft_blocks chunks. No prompt cache: the engine owns its KV
-        handling per request."""
+        Prompt rendering, preprocessing, and generation all run inside
+        mlx-vlm (see vlm_delegate), so model-specific caches and generation
+        modes remain authoritative there. This method adapts only the wire.
+        Diffusion families additionally support opt-in draft-block chunks."""
         delegate = self.model_provider.delegate
 
         if request.request_type == "chat":
@@ -1715,16 +1665,22 @@ class ResponseGenerator:
         else:
             prompt_text, images = request.prompt, []
         inputs = delegate.prepare(prompt_text, images)
-        prompt = [int(t) for t in inputs["input_ids"][0].tolist()]
+        prompt = [int(t) for t in inputs["input_ids"].reshape(-1).tolist()]
+
+        tokenizer = delegate.tokenizer
+        initial_state = "normal"
+        if tokenizer.has_thinking:
+            think_start = tokenizer.rfind_think_start(prompt)
+            think_end = tokenizer.rfind_think_end(prompt)
+            if think_start > think_end:
+                initial_state = "reasoning"
 
         ctx = GenerationContext(
-            has_tool_calling=False,
-            has_thinking=False,
-            tool_parser=None,
-            # One dummy length-1 sequence: _process_control_tokens buffers by
-            # the longest control sequence, so this passes responses (drafts
-            # included) straight through in order.
-            sequences={(0,): ""},
+            has_tool_calling=tokenizer.has_tool_calling,
+            has_thinking=tokenizer.has_thinking,
+            tool_parser=tokenizer.tool_parser,
+            text_sm=make_text_state_machine(tokenizer, args.stop_words),
+            initial_state=initial_state,
             prompt=prompt,
         )
         rqueue.put(ctx)
@@ -1744,12 +1700,24 @@ class ResponseGenerator:
                 inputs,
                 max_tokens=args.max_tokens,
                 temperature=args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                top_k=args.sampling.top_k,
+                min_p=args.sampling.min_p,
+                repetition_penalty=args.logits.repetition_penalty,
+                repetition_context_size=args.logits.repetition_context_size,
+                presence_penalty=args.logits.presence_penalty,
+                presence_context_size=args.logits.presence_context_size,
+                frequency_penalty=args.logits.frequency_penalty,
+                frequency_context_size=args.logits.frequency_context_size,
+                seed=args.seed,
+                stop_words=stop_words,
+                prefill_step_size=self.cli_args.prefill_step_size,
                 draft_blocks=want_drafts,
             ):
                 if gen.draft_blocks is not None:
                     rqueue.put(
                         Response(
-                            "", 0, "normal", None, 0.0, None, (),
+                            "", 0, 0.0, None, (),
                             draft_blocks=gen.draft_blocks,
                         )
                     )
@@ -1775,8 +1743,6 @@ class ResponseGenerator:
                     Response(
                         block_text if flush else "",
                         gen.token,
-                        "normal",
-                        None,
                         gen.logprob,
                         finish_reason,
                         (),
@@ -1816,7 +1782,7 @@ class ResponseGenerator:
         if isinstance(ctx, Exception):
             raise ctx
 
-        return ctx, _process_control_tokens(ctx, _inner())
+        return ctx, _inner()
 
     @property
     def cli_args(self):
@@ -1959,7 +1925,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "dry_sequence_breakers", ["\n", ":", "\"", "*"]
         )
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
+        self.xtc_threshold = self.body.get("xtc_threshold", 0.1)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
@@ -2137,7 +2103,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
             choice[key_name] = {"role": "assistant"}
-            if text:
+            if not self.stream:
+                # The schema requires "content" field to be present
+                choice[key_name]["content"] = text if text else None
+            elif text:
                 choice[key_name]["content"] = text
             if reasoning_text:
                 choice[key_name]["reasoning"] = reasoning_text
@@ -2231,8 +2200,11 @@ class APIHandler(BaseHTTPRequestHandler):
         # Tool call formatter
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
+        # Initialize the text state machine
+        sm_state = ctx.text_sm.make_state(ctx.initial_state)
+
         # Variables to save the generated text, tokens, logprobs, tools etc
-        prev_state = None
+        prev_state = ctx.initial_state
         finish_reason = "stop"
         reasoning_text = ""
         made_tool_call = False
@@ -2259,18 +2231,39 @@ class APIHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     continue
 
-                # Collect the text according to our current state and state
-                # transitions. Reasoning or tool or normal text.
-                if gen.state == "reasoning":
-                    reasoning_text += gen.text
-                elif gen.state == "tool":
-                    tool_text += gen.text
-                elif gen.state == "normal":
+                # Advance the text state machine to strip control sequences
+                if gen.finish_reason == "stop":
+                    # Some delegated engines attach a legitimate final decoded
+                    # segment to the terminal result. Feed it through the same
+                    # control matcher before discarding only the still-pending
+                    # stop-marker prefix. Ordinary EOS/stop text remains
+                    # stripped because it is registered in the state machine.
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, gen.text
+                    )
+                    sm_state, current_state = TextStateMachine.discard(sm_state)
+                elif gen.finish_reason == "length":
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, gen.text
+                    )
+                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
+                    clean_text += flushed
+                else:
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, gen.text
+                    )
+
+                # Collect the clean text by state: reasoning, tool, or normal
+                if current_state == "reasoning":
+                    reasoning_text += clean_text
+                elif current_state == "tool":
+                    tool_text += clean_text
+                elif current_state == "normal":
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
                         tool_text = ""
                         made_tool_call = True
-                    text += gen.text
+                    text += clean_text
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -2281,7 +2274,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if (
                     self.stream
-                    and gen.state != "tool"
+                    and current_state != "tool"
                     and (text or tool_calls or reasoning_text)
                 ):
                     resp = self.generate_response(
@@ -2299,7 +2292,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
 
-                prev_state = gen.state
+                prev_state = current_state
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)

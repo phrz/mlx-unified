@@ -474,18 +474,16 @@ class TestServeSinglePointWiring(unittest.TestCase):
             ["<POINT_1>", "<POINT_5>", "<POINT_10>", "1"],
         )
         self.assertEqual([r.token for r in responses[:4]], [109, 113, 118, 14])
-        # EOS ends generation through the state machine (its text is blanked
-        # downstream by _process_control_tokens — which is exactly why the
-        # coordinates ride a separate trailing chunk)
+        # EOS ends generation through the stop matcher; its text is discarded
+        # by the response text state machine, which is why coordinates ride a
+        # separate trailing chunk.
         self.assertEqual(responses[4].finish_reason, "stop")
-        self.assertEqual(responses[4].match, (0,))
         # the trailing chunk: point run -> pixel coordinates. patch 1/subpatch 0
         # -> vit id 3 at cell (1,0) of the 2x3 grid, location 2 -> (+0.5, +2.5)
         # *0.33, image 60x40
         coords = responses[5]
         self.assertEqual(coords.text, '\n<point id="1" image="0" x="3.3" y="36.5"/>')
         self.assertIsNone(coords.finish_reason)
-        self.assertIsNone(coords.match)
         # the finally block reset the visual side state
         self.assertIsNone(model.model._point_state)
 

@@ -18,6 +18,7 @@ from unittest import mock
 import mlx.core as mx
 import requests
 
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.server import (
     APIHandler,
     GenerationContext,
@@ -57,34 +58,41 @@ def raw_result(text="", token=0, finish=None, block=False, draft=None):
         diffusion_block_complete=block,
         is_draft=draft is not None,
         draft_blocks=draft,
+        logprobs=None,
     )
 
 
 class TestDelegateRegistry(unittest.TestCase):
     def test_detection(self):
         self.assertIn("diffusion_gemma", DELEGATED_VLM_FAMILIES)
+        self.assertIn("glm5_next", DELEGATED_VLM_FAMILIES)
+        self.assertIn("qwen4_exp", DELEGATED_VLM_FAMILIES)
         self.assertTrue(is_delegated_model_type("diffusion_gemma"))
+        self.assertTrue(is_delegated_model_type("glm5_next"))
+        self.assertTrue(is_delegated_model_type("qwen4_exp"))
         self.assertFalse(is_delegated_model_type("gemma4"))
         self.assertFalse(is_delegated_model_type("llama"))
         self.assertFalse(is_delegated_model_type(None))
 
     def test_model_provider_load_routes_to_delegate(self):
-        provider = ModelProvider(make_cli_args())
-        fake = SimpleNamespace(model="MODEL", tokenizer="TOKENIZER")
-        with tempfile.TemporaryDirectory() as d:
-            (Path(d) / "config.json").write_text(
-                json.dumps({"model_type": "diffusion_gemma"})
-            )
-            with mock.patch(
-                "mlx_lm.server.load_delegate", return_value=fake
-            ) as load_delegate:
-                provider._load(d)
-            load_delegate.assert_called_once()
-        self.assertIs(provider.delegate, fake)
-        self.assertEqual(provider.model, "MODEL")
-        self.assertEqual(provider.tokenizer, "TOKENIZER")
-        self.assertFalse(provider.is_batchable)
-        self.assertIsNone(provider.vision_encoder)
+        for model_type in ("diffusion_gemma", "glm5_next", "qwen4_exp"):
+            with self.subTest(model_type=model_type):
+                provider = ModelProvider(make_cli_args())
+                fake = SimpleNamespace(model="MODEL", tokenizer="TOKENIZER")
+                with tempfile.TemporaryDirectory() as d:
+                    (Path(d) / "config.json").write_text(
+                        json.dumps({"model_type": model_type})
+                    )
+                    with mock.patch(
+                        "mlx_lm.server.load_delegate", return_value=fake
+                    ) as load_delegate:
+                        provider._load(d)
+                    load_delegate.assert_called_once()
+                self.assertIs(provider.delegate, fake)
+                self.assertEqual(provider.model, "MODEL")
+                self.assertEqual(provider.tokenizer, "TOKENIZER")
+                self.assertFalse(provider.is_batchable)
+                self.assertIsNone(provider.vision_encoder)
 
     def test_model_provider_rejects_adapters_and_drafts(self):
         provider = ModelProvider(make_cli_args())
@@ -186,11 +194,29 @@ class TestAdaptResults(unittest.TestCase):
         self.assertTrue(out[0].block_complete)
         self.assertEqual(out[0].text, "")
 
+    def test_autoregressive_results_stream_per_token_and_fold_terminal_tail(self):
+        raw = [
+            raw_result(text="Hel", token=1),
+            raw_result(text="lo", token=2),
+            raw_result(text="!", token=2, finish="stop"),
+        ]
+        out = list(_adapt_results(raw, diffusion=False))
+
+        self.assertEqual([r.text for r in out], ["Hel", "lo!"])
+        self.assertTrue(all(r.block_complete for r in out))
+        self.assertIsNone(out[0].finish_reason)
+        self.assertEqual(out[1].finish_reason, "stop")
+
 
 class FakeDelegate:
     def __init__(self, script):
         self.script = script
         self.calls = {}
+        self.tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+        )
 
     def render_chat(self, messages, tools=None, **template_kwargs):
         self.calls["render_chat"] = (messages, tools, template_kwargs)
@@ -200,11 +226,12 @@ class FakeDelegate:
         self.calls["prepare"] = (prompt, images)
         return {"input_ids": mx.array([[1, 2, 3]])}
 
-    def stream(self, inputs, *, max_tokens, temperature, draft_blocks=False):
+    def stream(self, inputs, *, max_tokens, temperature, draft_blocks=False, **kwargs):
         self.calls["stream"] = {
             "max_tokens": max_tokens,
             "temperature": temperature,
             "draft_blocks": draft_blocks,
+            **kwargs,
         }
         yield from self.script
 
@@ -221,7 +248,7 @@ class TestServeDelegated(unittest.TestCase):
             model="model",
             tokenizer="tokenizer",
             draft_model=None,
-            cli_args=SimpleNamespace(chat_template_args={}),
+            cli_args=SimpleNamespace(chat_template_args={}, prefill_step_size=2048),
         )
         request = request or SimpleNamespace(
             request_type="chat",
@@ -235,7 +262,17 @@ class TestServeDelegated(unittest.TestCase):
             seed=None,
             chat_template_kwargs=None,
             stream_draft_blocks=stream_draft_blocks,
-            sampling=SimpleNamespace(temperature=0.0),
+            sampling=SimpleNamespace(
+                temperature=0.0, top_p=1.0, top_k=0, min_p=0.0
+            ),
+            logits=SimpleNamespace(
+                repetition_penalty=1.0,
+                repetition_context_size=20,
+                presence_penalty=0.0,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
+            ),
         )
         rqueue = Queue()
         rg._serve_single((rqueue, request, args))
@@ -330,7 +367,8 @@ class StubResponseGenerator:
             has_tool_calling=False,
             has_thinking=False,
             tool_parser=None,
-            sequences={(0,): ""},
+            text_sm=TextStateMachine(),
+            initial_state="normal",
             prompt=[1, 2, 3],
         )
         return ctx, iter(list(self.script))
@@ -359,11 +397,11 @@ class TestDraftWireFormat(unittest.TestCase):
 
     def setUp(self):
         self.response_generator.script = [
-            Response("", 0, "normal", None, 0.0, None, (), draft_blocks=["░░░░"]),
-            Response("", 0, "normal", None, 0.0, None, (), draft_blocks=["Hel░"]),
-            Response("Hel", 5, "normal", None, 0.0, None, ()),
-            Response("", 0, "normal", None, 0.0, None, (), draft_blocks=["lo░"]),
-            Response("lo", 6, "normal", None, 0.0, "stop", ()),
+            Response("", 0, 0.0, None, (), draft_blocks=["░░░░"]),
+            Response("", 0, 0.0, None, (), draft_blocks=["Hel░"]),
+            Response("Hel", 5, 0.0, None, ()),
+            Response("", 0, 0.0, None, (), draft_blocks=["lo░"]),
+            Response("lo", 6, 0.0, "stop", ()),
         ]
         self.response_generator.captured = []
 

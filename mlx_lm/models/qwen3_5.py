@@ -582,11 +582,9 @@ class TextModel(nn.Module):
         return int(accepted)
 
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
@@ -602,7 +600,7 @@ class TextModel(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
+            if has_unsanitized_conv1d and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights

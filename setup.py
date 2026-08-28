@@ -10,7 +10,7 @@ sys.path.append(str(package_dir))
 
 from _version import __version__
 
-MIN_MLX_VERSION = "0.31.2"
+MIN_MLX_VERSION = "0.32.1"
 
 setup(
     name="mlx-lm",
@@ -50,13 +50,14 @@ setup(
         "cpu": [f"mlx[cpu]>={MIN_MLX_VERSION}"],
         # mlx-unified: vision components (tower + processors) AND the serving
         # engine for delegated families (vlm_delegate) come from OUR mlx-vlm
-        # fork — the draft-blocks branch carries the x_stream_draft_blocks
-        # extension the server forwards, so mlx-unified owns which mlx-vlm it
-        # delegates to. (The old <5.13 transformers cap protected the string-form
+        # fork. Its main branch tracks current upstream model support while
+        # retaining the x_stream_draft_blocks extension the server forwards, so
+        # mlx-unified owns which mlx-vlm it delegates to. (The old <5.13
+        # transformers cap protected the string-form
         # AutoTokenizer.register; tokenizer_utils now uses the config-class form
         # from upstream #1465, and the rebased mlx-vlm needs >=5.14.)
         "vision": [
-            "mlx-vlm @ git+https://github.com/phrz/mlx-vlm@draft-blocks",
+            "mlx-vlm @ git+https://github.com/phrz/mlx-vlm@main",
             # Expert-aware SSD streaming (--stream-experts): lazy SwitchGLU expert
             # cache, MIT, built ON mlx-lm — import-not-vendor, pinned for stability.
             "mlx-moe @ git+https://github.com/mu-hashmi/mlx-moe@f054a9dc3b7ec9e91689249cd51390ddd6712047",
