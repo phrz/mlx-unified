@@ -31,7 +31,7 @@ from mlx_lm.vlm_delegate import (
     DelegatedResponse,
     VlmDelegate,
     _adapt_results,
-    _repair_glm5_next_vision_namespace,
+    _repair_glm5_next_namespaces,
     is_delegated_model_type,
     load_delegate,
 )
@@ -157,7 +157,7 @@ class TestDelegateRegistry(unittest.TestCase):
         delegate.close()
         manager.close.assert_called_once()
 
-    def test_glm5_next_checkpoint_vision_namespace_is_remapped_once(self):
+    def test_glm5_next_checkpoint_namespaces_are_remapped_once(self):
         class FakeModel:
             calls = []
 
@@ -171,14 +171,20 @@ class TestDelegateRegistry(unittest.TestCase):
             original_model = glm5.Model
             glm5.Model = FakeModel
             try:
-                _repair_glm5_next_vision_namespace()
-                _repair_glm5_next_vision_namespace()
+                _repair_glm5_next_namespaces()
+                _repair_glm5_next_namespaces()
                 model = FakeModel()
                 marker = object()
                 out = model.sanitize(
                     {
                         "vision_tower.post_layernorm.weight": marker,
                         "language_model.lm_head.weight": marker,
+                        "language_model.model.layers.0.self_attn.f_a_proj.weight": marker,
+                        "language_model.model.layers.0.self_attn.f_a_proj.scales": marker,
+                        "language_model.model.layers.0.self_attn.f_a_proj.biases": marker,
+                        "language_model.model.layers.0.self_attn.f_b_proj.weight": marker,
+                        "language_model.model.layers.0.self_attn.f_b_proj.scales": marker,
+                        "language_model.model.layers.0.self_attn.f_b_proj.biases": marker,
                     }
                 )
             finally:
@@ -187,6 +193,15 @@ class TestDelegateRegistry(unittest.TestCase):
         self.assertIs(out["vision_model.post_layernorm.weight"], marker)
         self.assertIs(out["language_model.lm_head.weight"], marker)
         self.assertNotIn("vision_tower.post_layernorm.weight", out)
+        for projection in ("f_a_proj", "f_b_proj"):
+            for suffix in ("weight", "scales", "biases"):
+                self.assertIs(
+                    out[
+                        "language_model.model.layers.0.self_attn."
+                        f"forget_gate.{projection}.{suffix}"
+                    ],
+                    marker,
+                )
         self.assertEqual(len(FakeModel.calls), 1)
 
 

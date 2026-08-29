@@ -416,8 +416,8 @@ def _repair_diffusion_gemma_processor():
     cls.__init__ = __init__
 
 
-def _repair_glm5_next_vision_namespace():
-    """Map converted GLM-5 ``vision_tower`` weights to ``vision_model``.
+def _repair_glm5_next_namespaces():
+    """Map converted GLM-5 container and forget-gate tensor names.
 
     Keep strict checking for all other tensor names.
     """
@@ -428,14 +428,17 @@ def _repair_glm5_next_vision_namespace():
     original_sanitize = Model.sanitize
 
     def sanitize(self, weights):
-        remapped = {
-            (
-                "vision_model." + key[len("vision_tower.") :]
-                if key.startswith("vision_tower.")
-                else key
-            ): value
-            for key, value in weights.items()
-        }
+        remapped = {}
+        for key, value in weights.items():
+            if key.startswith("vision_tower."):
+                key = "vision_model." + key[len("vision_tower.") :]
+            for projection in ("f_a_proj", "f_b_proj"):
+                source = f".self_attn.{projection}."
+                if source in key:
+                    key = key.replace(
+                        source, f".self_attn.forget_gate.{projection}."
+                    )
+            remapped[key] = value
         return original_sanitize(self, remapped)
 
     Model.sanitize = sanitize
@@ -465,7 +468,7 @@ def load_delegate(
     except (OSError, ValueError):
         model_type = None
     if model_type == "glm5_next":
-        _repair_glm5_next_vision_namespace()
+        _repair_glm5_next_namespaces()
     model, processor = vlm_load(str(model_path))
     from .utils import load_tokenizer
 
