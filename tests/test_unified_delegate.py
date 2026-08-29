@@ -251,6 +251,7 @@ class TestDelegateRegistry(unittest.TestCase):
             config=SimpleNamespace(model_type="glm5_next", eos_token_id=[2])
         )
         processor = SimpleNamespace()
+        detokenizer = object()
         with tempfile.TemporaryDirectory() as d:
             model_path = Path(d)
             (model_path / "config.json").write_text(
@@ -264,6 +265,10 @@ class TestDelegateRegistry(unittest.TestCase):
                     "transformers.PreTrainedTokenizerFast.from_pretrained",
                     return_value=processor,
                 ) as load_processor,
+                mock.patch(
+                    "mlx_vlm.tokenizer_utils.load_tokenizer",
+                    return_value=lambda tokenizer: detokenizer,
+                ) as load_detokenizer,
                 mock.patch("mlx_lm.utils.load_tokenizer", return_value="TOKENIZER"),
             ):
                 delegate = load_delegate(model_path)
@@ -271,6 +276,10 @@ class TestDelegateRegistry(unittest.TestCase):
         combined_load.assert_not_called()
         load_model.assert_called_once_with(model_path)
         load_processor.assert_called_once_with(model_path)
+        load_detokenizer.assert_called_once_with(
+            model_path, return_tokenizer=False
+        )
+        self.assertIs(processor.detokenizer, detokenizer)
         self.assertIs(delegate.model, model)
         self.assertIs(delegate.processor, processor)
         self.assertEqual(delegate.tokenizer, "TOKENIZER")

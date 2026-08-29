@@ -495,10 +495,15 @@ def load_delegate(
         # reparses and rejects the full model config. Load the strict MLX model
         # and its self-describing fast tokenizer independently.
         from mlx_vlm.utils import load_model as vlm_load_model
+        from mlx_vlm.tokenizer_utils import load_tokenizer as load_vlm_tokenizer
         from transformers import PreTrainedTokenizerFast
 
         model = vlm_load_model(Path(model_path))
         processor = PreTrainedTokenizerFast.from_pretrained(model_path)
+        detokenizer_class = load_vlm_tokenizer(
+            Path(model_path), return_tokenizer=False
+        )
+        processor.detokenizer = detokenizer_class(processor)
     else:
         model, processor = vlm_load(str(model_path))
     from .utils import load_tokenizer
