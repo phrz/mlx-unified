@@ -29,8 +29,10 @@ from mlx_lm.server import (
 from mlx_lm.vlm_delegate import (
     DELEGATED_VLM_FAMILIES,
     DelegatedResponse,
+    VlmDelegate,
     _adapt_results,
     is_delegated_model_type,
+    load_delegate,
 )
 
 
@@ -49,7 +51,7 @@ def make_cli_args(**overrides):
     return args
 
 
-def raw_result(text="", token=0, finish=None, block=False, draft=None):
+def raw_result(text="", token=0, finish=None, block=False, draft=None, cached=0):
     """A stand-in for mlx-vlm's GenerationResult (only the fields we read)."""
     return SimpleNamespace(
         text=text,
@@ -59,6 +61,7 @@ def raw_result(text="", token=0, finish=None, block=False, draft=None):
         is_draft=draft is not None,
         draft_blocks=draft,
         logprobs=None,
+        cached_tokens=cached,
     )
 
 
@@ -87,7 +90,11 @@ class TestDelegateRegistry(unittest.TestCase):
                         "mlx_lm.server.load_delegate", return_value=fake
                     ) as load_delegate:
                         provider._load(d)
-                    load_delegate.assert_called_once()
+                    load_delegate.assert_called_once_with(
+                        Path(d),
+                        prompt_cache_bytes=None,
+                        prompt_cache_disk_bytes=None,
+                    )
                 self.assertIs(provider.delegate, fake)
                 self.assertEqual(provider.model, "MODEL")
                 self.assertEqual(provider.tokenizer, "TOKENIZER")
@@ -111,16 +118,43 @@ class TestDelegateRegistry(unittest.TestCase):
         tokenizer = SimpleNamespace(chat_template=None)
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "config.json").write_text(json.dumps({"model_type": "llama"}))
-            with mock.patch(
-                "mlx_lm.server.load", return_value=(model, tokenizer)
-            ) as load, mock.patch(
-                "mlx_lm.server.load_delegate"
-            ) as load_delegate:
+            with (
+                mock.patch(
+                    "mlx_lm.server.load", return_value=(model, tokenizer)
+                ) as load,
+                mock.patch("mlx_lm.server.load_delegate") as load_delegate,
+            ):
                 provider._load(d)
             load.assert_called_once()
             load_delegate.assert_not_called()
         self.assertIsNone(provider.delegate)
         self.assertIs(provider.model, model)
+
+    def test_delegate_apc_uses_admitted_ram_ceiling(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="qwen4_exp", eos_token_id=[])
+        )
+        processor = SimpleNamespace()
+        manager = mock.Mock()
+        with (
+            mock.patch("mlx_lm.vlm_delegate._repair_diffusion_gemma_processor"),
+            mock.patch("mlx_vlm.utils.load", return_value=(model, processor)),
+            mock.patch("mlx_lm.utils.load_tokenizer", return_value="TOKENIZER"),
+            mock.patch("mlx_vlm.apc.apc_disk_namespace", return_value="namespace"),
+            mock.patch("mlx_vlm.apc.from_env", return_value=manager) as from_env,
+        ):
+            delegate = load_delegate(
+                "/model",
+                prompt_cache_bytes=4 * 1024**3,
+                prompt_cache_disk_bytes=0,
+            )
+
+        from_env.assert_called_once_with(
+            "namespace",
+            overrides={"enabled": True, "max_resident_bytes": 4 * 1024**3},
+        )
+        delegate.close()
+        manager.close.assert_called_once()
 
 
 class TestAdaptResults(unittest.TestCase):
@@ -187,7 +221,10 @@ class TestAdaptResults(unittest.TestCase):
         self.assertEqual("".join(r.text for r in out), "ab")
 
     def test_immediate_eos_yields_single_terminal_response(self):
-        raw = [raw_result(block=True, token=None), raw_result(finish="stop", token=None)]
+        raw = [
+            raw_result(block=True, token=None),
+            raw_result(finish="stop", token=None),
+        ]
         out = list(_adapt_results(raw))
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].finish_reason, "stop")
@@ -206,6 +243,98 @@ class TestAdaptResults(unittest.TestCase):
         self.assertTrue(all(r.block_complete for r in out))
         self.assertIsNone(out[0].finish_reason)
         self.assertEqual(out[1].finish_reason, "stop")
+
+    def test_cached_tokens_survive_autoregressive_adaptation(self):
+        out = list(
+            _adapt_results(
+                [
+                    raw_result(text="x", token=1, cached=17),
+                    raw_result(finish="stop", token=1, cached=17),
+                ],
+                diffusion=False,
+            )
+        )
+        self.assertEqual(out[-1].cached_tokens, 17)
+
+
+class TestExplicitCheckpointBoundary(unittest.TestCase):
+    def test_marker_selects_template_stable_prefix_without_generation_suffix(self):
+        model = SimpleNamespace(config=SimpleNamespace(model_type="qwen4_exp"))
+        delegate = VlmDelegate(model, SimpleNamespace(), SimpleNamespace())
+        messages = [
+            {"role": "system", "content": "rules"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "anchor",
+                        "prompt_cache_breakpoint": {"mode": "explicit"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "dynamic"},
+        ]
+
+        def fake_template(
+            _processor, _config, rendered, add_generation_prompt=True, **_
+        ):
+            text = "".join(f"<{m['role']}>{m.get('content', '')}|" for m in rendered)
+            return text + ("<assistant>" if add_generation_prompt else "")
+
+        def fake_prepare(prompt, _images):
+            return {"input_ids": mx.array([[ord(c) for c in prompt]])}
+
+        delegate.prepare = fake_prepare
+        with mock.patch(
+            "mlx_vlm.prompt_utils.apply_chat_template", side_effect=fake_template
+        ):
+            full_prompt, images = delegate.render_chat(messages)
+            full_inputs = delegate.prepare(full_prompt, images)
+            boundary = delegate.explicit_checkpoint_len(messages, full_inputs)
+            prefix_prompt, _ = delegate.render_chat(
+                messages[:2], add_generation_prompt=False
+            )
+
+        self.assertEqual(boundary, len(prefix_prompt))
+        self.assertNotIn("prompt_cache_breakpoint", prefix_prompt)
+
+    def test_delegate_forwards_apc_manager_tenant_and_boundary(self):
+        stopping = mock.Mock()
+        processor = SimpleNamespace(
+            tokenizer=SimpleNamespace(stopping_criteria=stopping)
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="qwen4_exp", eos_token_id=[])
+        )
+        manager = mock.Mock()
+        delegate = VlmDelegate(
+            model,
+            processor,
+            SimpleNamespace(),
+            apc_manager=manager,
+        )
+        terminal = raw_result(finish="length", cached=0)
+        with mock.patch(
+            "mlx_vlm.generate.stream_generate",
+            return_value=(result for result in [terminal]),
+        ) as stream_generate:
+            list(
+                delegate.stream(
+                    {"input_ids": mx.array([[1, 2, 3]])},
+                    max_tokens=0,
+                    temperature=0.0,
+                    apc_tenant="shared-prefix",
+                    apc_checkpoint_len=2,
+                    apc_ttl_seconds=1800,
+                )
+            )
+
+        kwargs = stream_generate.call_args.kwargs
+        self.assertIs(kwargs["apc_manager"], manager)
+        self.assertEqual(kwargs["apc_tenant"], "shared-prefix")
+        self.assertEqual(kwargs["apc_checkpoint_len"], 2)
+        self.assertEqual(kwargs["apc_ttl_seconds"], 1800)
 
 
 class FakeDelegate:
@@ -226,6 +355,17 @@ class FakeDelegate:
         self.calls["prepare"] = (prompt, images)
         return {"input_ids": mx.array([[1, 2, 3]])}
 
+    def explicit_checkpoint_len(
+        self, messages, inputs, *, tools=None, **template_kwargs
+    ):
+        self.calls["explicit_checkpoint_len"] = (
+            messages,
+            inputs,
+            tools,
+            template_kwargs,
+        )
+        return 2
+
     def stream(self, inputs, *, max_tokens, temperature, draft_blocks=False, **kwargs):
         self.calls["stream"] = {
             "max_tokens": max_tokens,
@@ -240,7 +380,15 @@ class TestServeDelegated(unittest.TestCase):
     """_serve_single routes delegated models to _serve_delegated_diffusion,
     driven directly (no HTTP)."""
 
-    def serve(self, script, request=None, stream_draft_blocks=True, stop_words=()):
+    def serve(
+        self,
+        script,
+        request=None,
+        stream_draft_blocks=True,
+        stop_words=(),
+        prompt_cache_key=None,
+        prompt_cache_options=None,
+    ):
         rg = ResponseGenerator.__new__(ResponseGenerator)  # skip the worker thread
         fake = FakeDelegate(script)
         rg.model_provider = SimpleNamespace(
@@ -261,10 +409,10 @@ class TestServeDelegated(unittest.TestCase):
             max_tokens=32,
             seed=None,
             chat_template_kwargs=None,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_options=prompt_cache_options,
             stream_draft_blocks=stream_draft_blocks,
-            sampling=SimpleNamespace(
-                temperature=0.0, top_p=1.0, top_k=0, min_p=0.0
-            ),
+            sampling=SimpleNamespace(temperature=0.0, top_p=1.0, top_k=0, min_p=0.0),
             logits=SimpleNamespace(
                 repetition_penalty=1.0,
                 repetition_context_size=20,
@@ -342,6 +490,37 @@ class TestServeDelegated(unittest.TestCase):
         committed = [r for r in items[1:] if r.draft_blocks is None]
         self.assertEqual("".join(r.text for r in committed), "foo ")
         self.assertEqual(committed[-1].finish_reason, "stop")
+
+    def test_explicit_prime_forwards_boundary_tenant_and_cached_usage(self):
+        request = SimpleNamespace(
+            request_type="chat",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "stable",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                }
+            ],
+            tools=None,
+            vision=None,
+        )
+        script = [DelegatedResponse("", 0, 0.0, True, "length", cached_tokens=2)]
+        fake, items = self.serve(
+            script,
+            request=request,
+            prompt_cache_key="shared-prefix",
+            prompt_cache_options={"mode": "explicit", "ttl": "30m"},
+        )
+        self.assertIn("explicit_checkpoint_len", fake.calls)
+        self.assertEqual(fake.calls["stream"]["apc_tenant"], "shared-prefix")
+        self.assertEqual(fake.calls["stream"]["apc_checkpoint_len"], 2)
+        self.assertEqual(fake.calls["stream"]["apc_ttl_seconds"], 1800)
+        self.assertEqual(items[0].prompt_cache_count, 2)
 
 
 class StubResponseGenerator:
@@ -528,6 +707,47 @@ class TestDraftWireFormat(unittest.TestCase):
             if c["choices"]
         ]
         self.assertEqual("".join(text), "Hello")
+
+    def test_prompt_cache_extensions_reach_generation_unchanged(self):
+        response = self.post(
+            {
+                "model": "delegated",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stable",
+                                "prompt_cache_breakpoint": {"mode": "explicit"},
+                            }
+                        ],
+                    }
+                ],
+                "max_tokens": 0,
+                "prompt_cache_key": "shared-prefix",
+                "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            }
+        )
+        self.assertEqual(response.status_code, 200)
+        request, args = self.response_generator.captured[-1]
+        self.assertEqual(args.prompt_cache_key, "shared-prefix")
+        self.assertEqual(args.prompt_cache_options, {"mode": "explicit", "ttl": "30m"})
+        self.assertEqual(
+            request.messages[0]["content"][0]["prompt_cache_breakpoint"],
+            {"mode": "explicit"},
+        )
+
+    def test_prompt_cache_extensions_fail_closed(self):
+        response = self.post(
+            {
+                "model": "delegated",
+                "messages": [{"role": "user", "content": "hi"}],
+                "prompt_cache_options": {"mode": "automatic"},
+            }
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("implicit or explicit", response.text)
 
 
 if __name__ == "__main__":

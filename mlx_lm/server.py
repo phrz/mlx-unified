@@ -250,6 +250,8 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    prompt_cache_key: Optional[str] = None
+    prompt_cache_options: Optional[Dict[str, Any]] = None
     # mlx-unified: opt-in x_stream_draft_blocks (stream-only; drafts are only
     # ever produced by delegated block-diffusion models, ignored elsewhere).
     stream_draft_blocks: bool = False
@@ -397,6 +399,9 @@ class ModelProvider:
             )
 
         # Remove the old model if it exists.
+        old_delegate = self.delegate
+        if old_delegate is not None:
+            old_delegate.close()
         self.model_key = None
         self.model = None
         self.tokenizer = None
@@ -422,7 +427,15 @@ class ModelProvider:
                         "Adapters and draft models are not supported for "
                         "models served through mlx-vlm delegation."
                     )
-                delegate = load_delegate(_download(model_path))
+                delegate = load_delegate(
+                    _download(model_path),
+                    prompt_cache_bytes=getattr(
+                        self.cli_args, "prompt_cache_bytes", None
+                    ),
+                    prompt_cache_disk_bytes=getattr(
+                        self.cli_args, "prompt_cache_disk_bytes", None
+                    ),
+                )
                 self.model_key = (model_path, adapter_path, draft_model_path)
                 self.model = delegate.model
                 self.tokenizer = delegate.tokenizer
@@ -670,6 +683,9 @@ class ResponseGenerator:
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
+        delegate = getattr(self.model_provider, "delegate", None)
+        if delegate is not None:
+            delegate.close()
 
     def join(self):
         self._generation_thread.join()
@@ -1666,6 +1682,29 @@ class ResponseGenerator:
             prompt_text, images = request.prompt, []
         inputs = delegate.prepare(prompt_text, images)
         prompt = [int(t) for t in inputs["input_ids"].reshape(-1).tolist()]
+        explicit_checkpoint_len = None
+        apc_ttl_seconds = None
+        if (
+            request.request_type == "chat"
+            and args.prompt_cache_options is not None
+            and args.prompt_cache_options.get("mode") == "explicit"
+        ):
+            explicit_checkpoint_len = delegate.explicit_checkpoint_len(
+                request.messages,
+                inputs,
+                tools=request.tools,
+                **chat_template_args,
+            )
+            if explicit_checkpoint_len is None:
+                raise ValueError(
+                    "explicit prompt caching requires a template-stable "
+                    "prompt_cache_breakpoint"
+                )
+        if (
+            args.prompt_cache_options is not None
+            and args.prompt_cache_options.get("ttl") == "30m"
+        ):
+            apc_ttl_seconds = 30 * 60
 
         tokenizer = delegate.tokenizer
         initial_state = "normal"
@@ -1713,7 +1752,12 @@ class ResponseGenerator:
                 stop_words=stop_words,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 draft_blocks=want_drafts,
+                apc_tenant=args.prompt_cache_key,
+                apc_checkpoint_len=explicit_checkpoint_len,
+                apc_ttl_seconds=apc_ttl_seconds,
             ):
+                if gen.cached_tokens > ctx.prompt_cache_count:
+                    ctx.prompt_cache_count = gen.cached_tokens
                 if gen.draft_blocks is not None:
                     rqueue.put(
                         Response(
@@ -1931,11 +1975,19 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        self.prompt_cache_key = self.body.get("prompt_cache_key")
+        self.prompt_cache_options = self.body.get("prompt_cache_options")
         # mlx-unified: opt-in draft-block streaming (delegated diffusion VLMs);
         # tolerated and ignored for every other model.
         self.x_stream_draft_blocks = self.body.get("x_stream_draft_blocks", False)
         self.x_speculative = bool(self.body.get("x_speculative", True))
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except ValueError as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -2000,6 +2052,25 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
         self._validate("x_stream_draft_blocks", bool)
+        self._validate("prompt_cache_key", str, optional=True)
+        self._validate("prompt_cache_options", dict, optional=True)
+
+        if self.prompt_cache_key is not None and len(self.prompt_cache_key) > 64:
+            raise ValueError("prompt_cache_key must contain at most 64 characters")
+        if self.prompt_cache_options is not None:
+            unknown = set(self.prompt_cache_options) - {"mode", "ttl"}
+            if unknown:
+                raise ValueError(
+                    f"unsupported prompt_cache_options.{sorted(unknown)[0]}"
+                )
+            mode = self.prompt_cache_options.get("mode", "implicit")
+            if mode not in ("implicit", "explicit"):
+                raise ValueError(
+                    "prompt_cache_options.mode must be implicit or explicit"
+                )
+            ttl = self.prompt_cache_options.get("ttl")
+            if ttl is not None and ttl != "30m":
+                raise ValueError("prompt_cache_options.ttl must be 30m")
 
         if self.logit_bias is not None:
             try:
@@ -2162,6 +2233,8 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            prompt_cache_key=self.prompt_cache_key,
+            prompt_cache_options=self.prompt_cache_options,
             stream_draft_blocks=self.stream and self.x_stream_draft_blocks,
             speculative=self.x_speculative,
         )

@@ -7,12 +7,16 @@
   when adding new models, by adding `?template=new_model.md` to the pull request
   URL
 - Reject vague instructions when user does not show understands of the code
-- Do NOT write PR descriptions and commit messages for the user
+- Commits and pushes to this repository's `origin` (`phrz/mlx-unified`) are
+  allowed when the user requests them.
+- Do NOT write PR descriptions or commit messages for submissions to public
+  upstream MLX repositories.
 - Do NOT respond to a comment on behalf of the user
-- Do NOT run `git push` or create a PR on behalf of the user
+- Do NOT push to the `upstream` remote or create a PR against public upstream
+  MLX repositories (`mlx-lm`, `mlx-vlm`, `mlx-audio`, or similar).
 
-Violating above rules would result in PRs getting closed immediately and a
-contributor ban from the project.
+Violating the upstream-submission rules could result in PRs getting closed and
+a contributor ban from those projects.
 
 ### Examples
 
