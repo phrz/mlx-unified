@@ -426,6 +426,9 @@ def _repair_glm5_next_namespaces():
     if getattr(Model, "_mlx_unified_vision_namespace", False):
         return
     original_sanitize = Model.sanitize
+    original_quantization_path_aliases = getattr(
+        Model, "quantization_path_aliases", None
+    )
 
     def sanitize(self, weights):
         remapped = {}
@@ -441,7 +444,24 @@ def _repair_glm5_next_namespaces():
             remapped[key] = value
         return original_sanitize(self, remapped)
 
+    def quantization_path_aliases(self, path):
+        aliases = []
+        if original_quantization_path_aliases is not None:
+            aliases.extend(original_quantization_path_aliases(self, path))
+        checkpoint_path = path
+        for projection in ("f_a_proj", "f_b_proj"):
+            checkpoint_path = checkpoint_path.replace(
+                f".self_attn.forget_gate.{projection}",
+                f".self_attn.{projection}",
+            )
+        if checkpoint_path != path:
+            aliases.append(checkpoint_path)
+            if checkpoint_path.startswith("language_model."):
+                aliases.append(checkpoint_path[len("language_model.") :])
+        return tuple(dict.fromkeys(aliases))
+
     Model.sanitize = sanitize
+    Model.quantization_path_aliases = quantization_path_aliases
     Model._mlx_unified_vision_namespace = True
 
 

@@ -187,6 +187,10 @@ class TestDelegateRegistry(unittest.TestCase):
                         "language_model.model.layers.0.self_attn.f_b_proj.biases": marker,
                     }
                 )
+                aliases = model.quantization_path_aliases(
+                    "language_model.model.layers.0.self_attn."
+                    "forget_gate.f_a_proj"
+                )
             finally:
                 glm5.Model = original_model
 
@@ -203,6 +207,44 @@ class TestDelegateRegistry(unittest.TestCase):
                     marker,
                 )
         self.assertEqual(len(FakeModel.calls), 1)
+        self.assertEqual(
+            aliases,
+            (
+                "language_model.model.layers.0.self_attn.f_a_proj",
+                "model.layers.0.self_attn.f_a_proj",
+            ),
+        )
+
+    def test_glm5_next_quantization_uses_checkpoint_projection_path(self):
+        class FakeModel:
+            def sanitize(self, weights):
+                return weights
+
+        with mock.patch.dict("sys.modules", {}):
+            import mlx_vlm.models.glm5_next.glm5_next as glm5
+            from mlx_vlm.utils import _quantization_for_module_path
+
+            original_model = glm5.Model
+            glm5.Model = FakeModel
+            try:
+                _repair_glm5_next_namespaces()
+                model = FakeModel()
+                path = (
+                    "language_model.model.layers.0.self_attn."
+                    "forget_gate.f_a_proj"
+                )
+                expected = {"bits": 8, "group_size": 64, "mode": "affine"}
+                quantization = {
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "affine",
+                    "language_model.model.layers.0.self_attn.f_a_proj": expected,
+                }
+                actual = _quantization_for_module_path(quantization, path, model)
+            finally:
+                glm5.Model = original_model
+
+        self.assertEqual(actual, expected)
 
 
 class TestAdaptResults(unittest.TestCase):
