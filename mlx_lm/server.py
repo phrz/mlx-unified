@@ -1464,6 +1464,7 @@ class ResponseGenerator:
                 self.prompt_cache.insert_cache(insert_key, cache_key, cache)
 
         except Exception as e:
+            logging.exception("Sequential generation failed")
             rqueue.put(e)
         finally:
             if getattr(request, "vision", None) is not None:
