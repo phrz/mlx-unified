@@ -680,6 +680,7 @@ class ResponseGenerator:
         self._stop = False
         self._initialization_complete = Event()
         self._initialization_error = None
+        self._last_generation_error = None
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
@@ -1465,6 +1466,7 @@ class ResponseGenerator:
 
         except Exception as e:
             logging.exception("Sequential generation failed")
+            self._last_generation_error = str(e)
             rqueue.put(e)
         finally:
             if getattr(request, "vision", None) is not None:
@@ -2530,6 +2532,10 @@ class APIHandler(BaseHTTPRequestHandler):
         body = {"status": status}
         if failed:
             body["error"] = str(self.response_generator._initialization_error)
+        if self.response_generator._last_generation_error is not None:
+            body["last_generation_error"] = str(
+                self.response_generator._last_generation_error
+            )
         self.wfile.write(json.dumps(body).encode())
         self.wfile.flush()
 

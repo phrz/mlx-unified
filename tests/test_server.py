@@ -401,6 +401,7 @@ class TestGenerationWorkerInitialization(unittest.TestCase):
             cli_args=SimpleNamespace(allowed_origins=["*"]),
             _initialization_complete=threading.Event(),
             _initialization_error=None,
+            _last_generation_error=None,
         )
         httpd = http.server.HTTPServer(
             ("localhost", 0),
@@ -419,11 +420,24 @@ class TestGenerationWorkerInitialization(unittest.TestCase):
             self.assertEqual(ready.status_code, 200)
             self.assertEqual(ready.json(), {"status": "ok"})
 
+            fake._last_generation_error = ValueError("decode failed")
+            diagnostic = requests.get(url)
+            self.assertEqual(diagnostic.status_code, 200)
+            self.assertEqual(
+                diagnostic.json(),
+                {"status": "ok", "last_generation_error": "decode failed"},
+            )
+
             fake._initialization_error = ValueError("broken")
             failed = requests.get(url)
             self.assertEqual(failed.status_code, 500)
             self.assertEqual(
-                failed.json(), {"status": "error", "error": "broken"}
+                failed.json(),
+                {
+                    "status": "error",
+                    "error": "broken",
+                    "last_generation_error": "decode failed",
+                },
             )
         finally:
             httpd.shutdown()
