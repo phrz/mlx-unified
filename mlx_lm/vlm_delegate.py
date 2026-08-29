@@ -489,7 +489,18 @@ def load_delegate(
         model_type = None
     if model_type == "glm5_next":
         _repair_glm5_next_namespaces()
-    model, processor = vlm_load(str(model_path))
+        # GLM conversion checkpoints can retain one MTP-only mlp_layer_types
+        # entry beyond num_hidden_layers. The MLX model consumes the base-layer
+        # schedule correctly, but AutoProcessor -> AutoTokenizer needlessly
+        # reparses and rejects the full model config. Load the strict MLX model
+        # and its self-describing fast tokenizer independently.
+        from mlx_vlm.utils import load_model as vlm_load_model
+        from transformers import PreTrainedTokenizerFast
+
+        model = vlm_load_model(Path(model_path))
+        processor = PreTrainedTokenizerFast.from_pretrained(model_path)
+    else:
+        model, processor = vlm_load(str(model_path))
     from .utils import load_tokenizer
 
     text_config = getattr(model.config, "text_config", None)

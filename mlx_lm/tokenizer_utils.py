@@ -610,7 +610,21 @@ def load(
     tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer_loader = AutoTokenizer
+    if tokenizer_config_file.exists():
+        try:
+            with open(tokenizer_config_file, encoding="utf-8") as fid:
+                configured_tokenizer = json.load(fid).get("tokenizer_class")
+            if configured_tokenizer == "TokenizersBackend":
+                # A self-contained tokenizer.json does not need the model config.
+                # Avoid AutoTokenizer's otherwise-unnecessary AutoConfig load:
+                # converted checkpoints may retain MTP-only metadata that the
+                # current Transformers model validator does not accept.
+                tokenizer_loader = PreTrainedTokenizerFast
+        except (JSONDecodeError, OSError):
+            pass
+
+    tokenizer = tokenizer_loader.from_pretrained(
         model_path, **(tokenizer_config_extra or {})
     )
 

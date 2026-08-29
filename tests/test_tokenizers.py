@@ -1,7 +1,11 @@
 # Copyright © 2024 Apple Inc.
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from huggingface_hub import snapshot_download
 
@@ -10,11 +14,40 @@ from mlx_lm.tokenizer_utils import (
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
+    load,
 )
 from mlx_lm.utils import load_tokenizer
 
 
 class TestTokenizers(unittest.TestCase):
+
+    def test_backend_tokenizer_does_not_load_model_config(self):
+        tokenizer = SimpleNamespace(
+            init_kwargs={},
+            chat_template=None,
+            eos_token_id=2,
+            get_vocab=lambda: {},
+        )
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            (path / "tokenizer_config.json").write_text(
+                json.dumps({"tokenizer_class": "TokenizersBackend"})
+            )
+            (path / "tokenizer.json").write_text(json.dumps({}))
+            with (
+                mock.patch(
+                    "mlx_lm.tokenizer_utils.PreTrainedTokenizerFast.from_pretrained",
+                    return_value=tokenizer,
+                ) as fast_load,
+                mock.patch(
+                    "mlx_lm.tokenizer_utils.AutoTokenizer.from_pretrained"
+                ) as auto_load,
+            ):
+                wrapped = load(path)
+
+        fast_load.assert_called_once_with(path)
+        auto_load.assert_not_called()
+        self.assertIs(wrapped._tokenizer, tokenizer)
 
     def check_tokenizer(self, tokenizer):
         def check(tokens):

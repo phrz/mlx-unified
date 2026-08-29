@@ -246,6 +246,35 @@ class TestDelegateRegistry(unittest.TestCase):
 
         self.assertEqual(actual, expected)
 
+    def test_glm5_next_load_bypasses_processor_model_config_parse(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="glm5_next", eos_token_id=[2])
+        )
+        processor = SimpleNamespace()
+        with tempfile.TemporaryDirectory() as d:
+            model_path = Path(d)
+            (model_path / "config.json").write_text(
+                json.dumps({"model_type": "glm5_next"})
+            )
+            with (
+                mock.patch("mlx_lm.vlm_delegate._repair_glm5_next_namespaces"),
+                mock.patch("mlx_vlm.utils.load") as combined_load,
+                mock.patch("mlx_vlm.utils.load_model", return_value=model) as load_model,
+                mock.patch(
+                    "transformers.PreTrainedTokenizerFast.from_pretrained",
+                    return_value=processor,
+                ) as load_processor,
+                mock.patch("mlx_lm.utils.load_tokenizer", return_value="TOKENIZER"),
+            ):
+                delegate = load_delegate(model_path)
+
+        combined_load.assert_not_called()
+        load_model.assert_called_once_with(model_path)
+        load_processor.assert_called_once_with(model_path)
+        self.assertIs(delegate.model, model)
+        self.assertIs(delegate.processor, processor)
+        self.assertEqual(delegate.tokenizer, "TOKENIZER")
+
 
 class TestAdaptResults(unittest.TestCase):
     """_adapt_results mirrors mlx_vlm.server's _diffusion_block_chunks
