@@ -253,6 +253,7 @@ class TestDelegateRegistry(unittest.TestCase):
         )
         processor = SimpleNamespace()
         detokenizer = object()
+        stopping_criteria = object()
         with tempfile.TemporaryDirectory() as d:
             model_path = Path(d)
             (model_path / "config.json").write_text(
@@ -270,6 +271,10 @@ class TestDelegateRegistry(unittest.TestCase):
                     "mlx_vlm.tokenizer_utils.load_tokenizer",
                     return_value=lambda tokenizer: detokenizer,
                 ) as load_detokenizer,
+                mock.patch(
+                    "mlx_vlm.utils.StoppingCriteria",
+                    return_value=stopping_criteria,
+                ) as make_stopping_criteria,
                 mock.patch("mlx_lm.utils.load_tokenizer", return_value="TOKENIZER"),
             ):
                 delegate = load_delegate(model_path)
@@ -281,6 +286,10 @@ class TestDelegateRegistry(unittest.TestCase):
             model_path, return_tokenizer=False
         )
         self.assertIs(processor.detokenizer, detokenizer)
+        make_stopping_criteria.assert_called_once_with(
+            [2], processor, additional_eos_token_ids=()
+        )
+        self.assertIs(processor.stopping_criteria, stopping_criteria)
         self.assertIs(delegate.model, model)
         self.assertIs(delegate.processor, processor)
         self.assertEqual(delegate.tokenizer, "TOKENIZER")

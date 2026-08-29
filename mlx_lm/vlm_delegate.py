@@ -526,6 +526,7 @@ def load_delegate(
         # schedule correctly, but AutoProcessor -> AutoTokenizer needlessly
         # reparses and rejects the full model config. Load the strict MLX model
         # and its self-describing fast tokenizer independently.
+        from mlx_vlm.utils import StoppingCriteria
         from mlx_vlm.utils import load_model as vlm_load_model
         from mlx_vlm.tokenizer_utils import load_tokenizer as load_vlm_tokenizer
         from transformers import PreTrainedTokenizerFast
@@ -537,6 +538,16 @@ def load_delegate(
             Path(model_path), return_tokenizer=False
         )
         processor.detokenizer = detokenizer_class(processor)
+        eos_token_ids = getattr(model.config, "eos_token_id", None)
+        if eos_token_ids is None:
+            eos_token_ids = getattr(model.config.text_config, "eos_token_id", None)
+        processor.stopping_criteria = StoppingCriteria(
+            eos_token_ids,
+            processor,
+            additional_eos_token_ids=getattr(
+                processor, "additional_eos_token_ids", ()
+            ),
+        )
     else:
         model, processor = vlm_load(str(model_path))
     from .utils import load_tokenizer
