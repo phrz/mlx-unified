@@ -31,6 +31,7 @@ from mlx_lm.vlm_delegate import (
     DelegatedResponse,
     VlmDelegate,
     _adapt_results,
+    _disable_incompatible_glm5_next_fusion,
     _repair_glm5_next_namespaces,
     is_delegated_model_type,
     load_delegate,
@@ -283,6 +284,56 @@ class TestDelegateRegistry(unittest.TestCase):
         self.assertIs(delegate.model, model)
         self.assertIs(delegate.processor, processor)
         self.assertEqual(delegate.tokenizer, "TOKENIZER")
+
+    def test_glm5_next_mixed_quantization_disables_input_fusion(self):
+        def projection(width, bits):
+            return SimpleNamespace(
+                weight=SimpleNamespace(shape=(128, width)),
+                group_size=64,
+                bits=bits,
+                scales=object(),
+            )
+
+        attention = SimpleNamespace(
+            q_proj=projection(640, 5),
+            k_proj=projection(1024, 8),
+            v_proj=projection(640, 5),
+            forget_gate=SimpleNamespace(f_a_proj=projection(1024, 8)),
+            g_a_proj=projection(1024, 8),
+            b_proj=projection(1024, 8),
+            fuse_in=True,
+        )
+        model = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=attention)]
+        )
+
+        self.assertEqual(_disable_incompatible_glm5_next_fusion(model), 1)
+        self.assertFalse(attention.fuse_in)
+
+    def test_glm5_next_uniform_quantization_keeps_input_fusion(self):
+        def projection():
+            return SimpleNamespace(
+                weight=SimpleNamespace(shape=(128, 512)),
+                group_size=64,
+                bits=4,
+                scales=object(),
+            )
+
+        attention = SimpleNamespace(
+            q_proj=projection(),
+            k_proj=projection(),
+            v_proj=projection(),
+            forget_gate=SimpleNamespace(f_a_proj=projection()),
+            g_a_proj=projection(),
+            b_proj=projection(),
+            fuse_in=True,
+        )
+        model = SimpleNamespace(
+            layers=[SimpleNamespace(self_attn=attention)]
+        )
+
+        self.assertEqual(_disable_incompatible_glm5_next_fusion(model), 0)
+        self.assertTrue(attention.fuse_in)
 
 
 class TestAdaptResults(unittest.TestCase):

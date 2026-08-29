@@ -465,6 +465,38 @@ def _repair_glm5_next_namespaces():
     Model._mlx_unified_vision_namespace = True
 
 
+def _disable_incompatible_glm5_next_fusion(model):
+    """Keep GLM's fused input projection only for identical quant layouts."""
+    disabled = 0
+    for layer in getattr(model, "layers", ()):
+        attention = getattr(layer, "self_attn", None)
+        forget_gate = getattr(attention, "forget_gate", None)
+        if attention is None or forget_gate is None:
+            continue
+        modules = (
+            attention.q_proj,
+            attention.k_proj,
+            attention.v_proj,
+            forget_gate.f_a_proj,
+            attention.g_a_proj,
+            attention.b_proj,
+        )
+        signatures = {
+            (
+                type(module),
+                tuple(module.weight.shape[1:]),
+                getattr(module, "group_size", None),
+                getattr(module, "bits", None),
+                hasattr(module, "scales"),
+            )
+            for module in modules
+        }
+        if len(signatures) > 1:
+            attention.fuse_in = False
+            disabled += 1
+    return disabled
+
+
 def load_delegate(
     model_path,
     *,
@@ -499,6 +531,7 @@ def load_delegate(
         from transformers import PreTrainedTokenizerFast
 
         model = vlm_load_model(Path(model_path))
+        _disable_incompatible_glm5_next_fusion(model)
         processor = PreTrainedTokenizerFast.from_pretrained(model_path)
         detokenizer_class = load_vlm_tokenizer(
             Path(model_path), return_tokenizer=False
