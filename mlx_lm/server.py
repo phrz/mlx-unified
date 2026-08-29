@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Event, Thread
 from typing import (
     Any,
     Callable,
@@ -31,6 +31,7 @@ from typing import (
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
+from huggingface_hub.errors import CacheNotFound
 
 from ._version import __version__
 from .diffusion_generate import is_diffusion_model, stream_diffusion_generate
@@ -677,6 +678,8 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
+        self._initialization_complete = Event()
+        self._initialization_error = None
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
@@ -921,8 +924,16 @@ class ResponseGenerator:
         # synchronization messages.
         generation_stream = mx.default_stream(mx.default_device())
 
-        # Load the default model if it is given
-        self.model_provider.load_default()
+        # Load before advertising readiness. Keep startup failures so requests
+        # return the error instead of waiting on a dead worker.
+        try:
+            self.model_provider.load_default()
+        except Exception as error:
+            self._initialization_error = error
+            logging.exception("Generation worker failed to initialize")
+            self._initialization_complete.set()
+            return
+        self._initialization_complete.set()
 
         current_model = None
         current_sampling = None
@@ -1806,6 +1817,11 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
+        self._initialization_complete.wait()
+        if self._initialization_error is not None:
+            raise RuntimeError(
+                f"generation worker failed to initialize: {self._initialization_error}"
+            ) from self._initialization_error
         response_queue = Queue()
         self.requests.put((response_queue, request, generation_args))
 
@@ -2504,10 +2520,16 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /health endpoint.
         """
-        self._set_completion_headers(200)
+        initialized = self.response_generator._initialization_complete.is_set()
+        failed = self.response_generator._initialization_error is not None
+        self._set_completion_headers(500 if failed else 200 if initialized else 503)
         self.end_headers()
 
-        self.wfile.write('{"status": "ok"}'.encode())
+        status = "error" if failed else "ok" if initialized else "loading"
+        body = {"status": status}
+        if failed:
+            body["error"] = str(self.response_generator._initialization_error)
+        self.wfile.write(json.dumps(body).encode())
         self.wfile.flush()
 
     def handle_models_request(self):
@@ -2535,10 +2557,15 @@ class APIHandler(BaseHTTPRequestHandler):
             return all(f in file_names for f in files)
 
         # Scan the cache directory for downloaded mlx models
-        hf_cache_info = scan_cache_dir()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
+        try:
+            hf_cache_info = scan_cache_dir()
+            downloaded_models = [
+                repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
+            ]
+        except CacheNotFound:
+            # An explicit local checkpoint does not require the default HF
+            # cache directory. Keep its configured model in the response.
+            downloaded_models = []
 
         # Create a list of available models
         models = [

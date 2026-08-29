@@ -416,6 +416,32 @@ def _repair_diffusion_gemma_processor():
     cls.__init__ = __init__
 
 
+def _repair_glm5_next_vision_namespace():
+    """Map converted GLM-5 ``vision_tower`` weights to ``vision_model``.
+
+    Keep strict checking for all other tensor names.
+    """
+    from mlx_vlm.models.glm5_next.glm5_next import Model
+
+    if getattr(Model, "_mlx_unified_vision_namespace", False):
+        return
+    original_sanitize = Model.sanitize
+
+    def sanitize(self, weights):
+        remapped = {
+            (
+                "vision_model." + key[len("vision_tower.") :]
+                if key.startswith("vision_tower.")
+                else key
+            ): value
+            for key, value in weights.items()
+        }
+        return original_sanitize(self, remapped)
+
+    Model.sanitize = sanitize
+    Model._mlx_unified_vision_namespace = True
+
+
 def load_delegate(
     model_path,
     *,
@@ -431,6 +457,15 @@ def load_delegate(
             f"installed (pip install 'mlx-lm[vision]'): {e}"
         )
     _repair_diffusion_gemma_processor()
+    try:
+        import json
+
+        with open(Path(model_path) / "config.json") as config_file:
+            model_type = json.load(config_file).get("model_type")
+    except (OSError, ValueError):
+        model_type = None
+    if model_type == "glm5_next":
+        _repair_glm5_next_vision_namespace()
     model, processor = vlm_load(str(model_path))
     from .utils import load_tokenizer
 

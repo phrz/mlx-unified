@@ -5,9 +5,12 @@ import io
 import json
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import mlx.core as mx
 import requests
+from huggingface_hub.errors import CacheNotFound
 
 from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
@@ -367,6 +370,65 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+
+    def test_handle_models_without_default_hf_cache(self):
+        url = f"http://localhost:{self.port}/v1/models"
+        with mock.patch(
+            "mlx_lm.server.scan_cache_dir",
+            side_effect=CacheNotFound("missing cache", "/missing"),
+        ):
+            response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"object": "list", "data": []})
+
+
+class TestGenerationWorkerInitialization(unittest.TestCase):
+    def test_failed_initialization_is_returned_instead_of_hanging(self):
+        class BrokenProvider:
+            cli_args = SimpleNamespace()
+
+            def load_default(self):
+                raise ValueError("strict checkpoint mismatch")
+
+        generator = ResponseGenerator(BrokenProvider(), LRUPromptCache())
+        self.assertTrue(generator._initialization_complete.wait(2))
+        with self.assertRaisesRegex(RuntimeError, "strict checkpoint mismatch"):
+            generator.generate(mock.Mock(), mock.Mock())
+        generator.stop_and_join()
+
+    def test_health_stays_unready_until_worker_initialization_finishes(self):
+        fake = SimpleNamespace(
+            cli_args=SimpleNamespace(allowed_origins=["*"]),
+            _initialization_complete=threading.Event(),
+            _initialization_error=None,
+        )
+        httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(fake, *args, **kwargs),
+        )
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://localhost:{httpd.server_port}/health"
+            loading = requests.get(url)
+            self.assertEqual(loading.status_code, 503)
+            self.assertEqual(loading.json(), {"status": "loading"})
+
+            fake._initialization_complete.set()
+            ready = requests.get(url)
+            self.assertEqual(ready.status_code, 200)
+            self.assertEqual(ready.json(), {"status": "ok"})
+
+            fake._initialization_error = ValueError("broken")
+            failed = requests.get(url)
+            self.assertEqual(failed.status_code, 500)
+            self.assertEqual(
+                failed.json(), {"status": "error", "error": "broken"}
+            )
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
 
 
 class TestServerWithDraftModel(unittest.TestCase):
