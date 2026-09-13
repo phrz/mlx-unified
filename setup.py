@@ -12,6 +12,11 @@ from _version import __version__
 
 MIN_MLX_VERSION = "0.32.1"
 
+# mlx-unified: grammar-enforced `response_format` in mlx_lm.server
+# (structured_output.py). outlines-core is Rust-backed and backend-agnostic; it
+# only needs the tokenizer vocabulary, so the extra is pure-Python-side glue.
+STRUCTURED_DEPS = ["outlines-core>=0.2.11,<0.3"]
+
 setup(
     name="mlx-lm",
     version=__version__,
@@ -63,7 +68,11 @@ setup(
             "mlx-moe @ git+https://github.com/mu-hashmi/mlx-moe@f054a9dc3b7ec9e91689249cd51390ddd6712047",
             "Pillow",
             "transformers>=5.14.0",
+            # The unified serving profile (what Runway installs) enforces
+            # response_format; keep the extra in sync with "structured".
+            *STRUCTURED_DEPS,
         ],
+        "structured": STRUCTURED_DEPS,
     },
     entry_points={
         "console_scripts": [

@@ -51,9 +51,21 @@ from .multimodal import (
     render_image_points,
 )
 from .sample_utils import make_logits_processors, make_sampler
+from .structured_output import (
+    StructuredIndexCache,
+    StructuredOutputError,
+    make_guided_processor,
+    parse_response_format,
+)
 from .tokenizer_utils import StreamingDetokenizer, TokenizerWrapper
 from .utils import _download, _parse_size, load, sharded_load
 from .vlm_delegate import is_delegated_model_type, load_delegate
+
+# mlx-unified: the server enforces `response_format` (json_schema / json_object)
+# with grammar-constrained decoding (structured_output.py). Runway reads this
+# literal from the installed source to advertise `response_format`; bump it
+# only for an incompatible change in what a request may send or expect.
+STRUCTURED_OUTPUT_CONTRACT_VERSION = 1
 
 
 def get_system_fingerprint():
@@ -259,6 +271,8 @@ class GenerationArguments:
     # mlx-unified: x_speculative=false disables the server's draft model for
     # THIS request (A/B benchmarking drafted vs plain decode without a reload).
     speculative: bool = True
+    # mlx-unified: a compiled `response_format` (structured_output.ResponseFormatSpec).
+    structured_output: Optional[Any] = None
 
 
 @dataclass
@@ -673,6 +687,7 @@ class ResponseGenerator:
         self.prompt_cache = prompt_cache
         self.requests = Queue()
         self._state_machine_cache = {}
+        self._structured_index_cache = StructuredIndexCache()
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -887,6 +902,22 @@ class ResponseGenerator:
 
         return prompt, segments, segment_types, initial_state
 
+    def _structured_processors(self, args, tokenizer, initial_state):
+        """Grammar processors for a request's response_format (mlx-unified)."""
+        spec = getattr(args, "structured_output", None)
+        if spec is None:
+            return []
+        cache = getattr(self, "_structured_index_cache", None)
+        if cache is None:
+            cache = self._structured_index_cache = StructuredIndexCache()
+        return make_guided_processor(
+            cache,
+            self.model_provider.model_key,
+            tokenizer,
+            spec,
+            initial_state=initial_state,
+        )
+
     def _make_state_machine(self, model_key, tokenizer, stop_words):
         """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
         cache_key = (model_key, tuple(stop_words))
@@ -980,6 +1011,9 @@ class ResponseGenerator:
                         prompt, segments, segment_types, initial_state = self._tokenize(
                             current_tokenizer, request, args
                         )
+                        structured = self._structured_processors(
+                            args, current_tokenizer, initial_state
+                        )
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -1021,7 +1055,9 @@ class ResponseGenerator:
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args, tokenizer)],
+                        logits_processors=[
+                            _make_logits_processors(args, tokenizer) + structured
+                        ],
                         stop_matchers=[stop_matcher],
                     )
                     batch_results[uid] = {
@@ -1199,11 +1235,21 @@ class ResponseGenerator:
             # mlx-unified: streamed-expert models generate through mlx-moe's own
             # session on its dedicated thread (see _serve_streamed_experts).
             if getattr(self.model_provider, "moe_session", None) is not None:
+                if getattr(args, "structured_output", None) is not None:
+                    raise StructuredOutputError(
+                        "structured output is not supported with --stream-experts"
+                    )
                 self._serve_streamed_experts(rqueue, request, args)
                 return
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            if getattr(args, "structured_output", None) is not None and is_diffusion_model(model):
+                raise StructuredOutputError(
+                    "structured output is not supported for diffusion models"
+                )
+            # Built before the context is handed back so a bad schema is a 400.
+            structured = self._structured_processors(args, tokenizer, initial_state)
             stop_matcher, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -1234,7 +1280,12 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args, tokenizer)
+            logits_processors = _make_logits_processors(args, tokenizer) + structured
+            if structured and draft_model is not None:
+                # A grammar guide advances on every sampled token; draft
+                # verification rejects tokens it cannot see. Decode plainly.
+                logging.info("structured output: bypassing the draft model for this request")
+                draft_model = None
 
             # mlx-unified: multimodal requests get their OWN cache namespace, keyed by
             # every image referenced so far in the conversation (order-sensitive) —
@@ -1727,6 +1778,11 @@ class ResponseGenerator:
             think_end = tokenizer.rfind_think_end(prompt)
             if think_start > think_end:
                 initial_state = "reasoning"
+        if getattr(args, "structured_output", None) is not None and getattr(delegate, "is_diffusion", False):
+            raise StructuredOutputError(
+                "structured output is not supported for diffusion models"
+            )
+        structured = self._structured_processors(args, tokenizer, initial_state)
 
         ctx = GenerationContext(
             has_tool_calling=tokenizer.has_tool_calling,
@@ -1769,6 +1825,7 @@ class ResponseGenerator:
                 apc_tenant=args.prompt_cache_key,
                 apc_checkpoint_len=explicit_checkpoint_len,
                 apc_ttl_seconds=apc_ttl_seconds,
+                logits_processors=structured or None,
             ):
                 if gen.cached_tokens > ctx.prompt_cache_count:
                     ctx.prompt_cache_count = gen.cached_tokens
@@ -2000,6 +2057,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # tolerated and ignored for every other model.
         self.x_stream_draft_blocks = self.body.get("x_stream_draft_blocks", False)
         self.x_speculative = bool(self.body.get("x_speculative", True))
+        self.response_format = self.body.get("response_format")
         try:
             self.validate_model_parameters()
         except ValueError as e:
@@ -2073,6 +2131,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("x_stream_draft_blocks", bool)
         self._validate("prompt_cache_key", str, optional=True)
         self._validate("prompt_cache_options", dict, optional=True)
+        # StructuredOutputError is a ValueError: the caller answers 400.
+        self.structured_output = parse_response_format(self.response_format)
 
         if self.prompt_cache_key is not None and len(self.prompt_cache_key) > 64:
             raise ValueError("prompt_cache_key must contain at most 64 characters")
@@ -2256,6 +2316,7 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache_options=self.prompt_cache_options,
             stream_draft_blocks=self.stream and self.x_stream_draft_blocks,
             speculative=self.x_speculative,
+            structured_output=self.structured_output,
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -2274,6 +2335,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 args,
                 progress_callback=keepalive_callback,
             )
+        except StructuredOutputError as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()

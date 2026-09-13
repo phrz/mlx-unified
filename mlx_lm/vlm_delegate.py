@@ -297,6 +297,7 @@ class VlmDelegate:
         apc_tenant: Optional[str] = None,
         apc_checkpoint_len: Optional[int] = None,
         apc_ttl_seconds: Optional[float] = None,
+        logits_processors: Optional[List[Any]] = None,
     ) -> Iterator[DelegatedResponse]:
         """Drive mlx-vlm's authoritative generator and adapt its results."""
 
@@ -318,6 +319,8 @@ class VlmDelegate:
         if hasattr(tokenizer, "stopping_criteria"):
             tokenizer.stopping_criteria.reset(getattr(self.config, "eos_token_id", None))
         if self.is_diffusion:
+            if logits_processors:
+                raise ValueError("logits processors cannot steer a diffusion canvas")
             from mlx_vlm.generate.diffusion import stream_diffusion_generate
 
             skip_special_token_ids = set(
@@ -369,6 +372,7 @@ class VlmDelegate:
                 apc_tenant=apc_tenant,
                 apc_checkpoint_len=apc_checkpoint_len,
                 apc_ttl_seconds=apc_ttl_seconds,
+                logits_processors=logits_processors,
                 **forwarded,
             )
         try:
