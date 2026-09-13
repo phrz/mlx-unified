@@ -170,14 +170,19 @@ class TestTokenBytes(unittest.TestCase):
 
 @unittest.skipUnless(OUTLINES_AVAILABLE, "outlines-core not installed")
 class TestGuidedLogitsProcessor(unittest.TestCase):
-    def processor(self, tokenizer=None, initial_state="normal"):
+    def processor(self, tokenizer=None, initial_state="normal", offer_thinking=True):
         tokenizer = tokenizer or FakeTokenizer()
         cache = StructuredIndexCache()
         spec = parse_response_format(
             {"type": "json_schema", "json_schema": {"schema": SCHEMA}}
         )
         (processor,) = make_guided_processor(
-            cache, ("model", None), tokenizer, spec, initial_state=initial_state
+            cache,
+            ("model", None),
+            tokenizer,
+            spec,
+            initial_state=initial_state,
+            offer_thinking=offer_thinking,
         )
         return processor
 
@@ -230,6 +235,31 @@ class TestGuidedLogitsProcessor(unittest.TestCase):
         allowed, _ = allowed_ids(p, [10, THINK_START, 16, THINK_END])
         self.assertEqual(p.phase, "guided")
         self.assertEqual(allowed, {0})
+
+    def test_a_two_token_think_start_offers_each_token_once(self):
+        # Gemma 4 opens a think block with <|channel> then "thought". After the
+        # first is generated the mask must offer the second, not the first
+        # again: a mask cached on the guide state alone served the first
+        # step's mask twice and the repeated opener then "left the grammar".
+        tokenizer = FakeTokenizer()
+        tokenizer._think_start_tokens = (THINK_START, 16)
+        p = self.processor(tokenizer)
+        allowed, _ = allowed_ids(p, [10])
+        self.assertEqual(allowed, {0, THINK_START})
+        allowed, _ = allowed_ids(p, [10, THINK_START])
+        self.assertEqual(allowed, {0, 16})
+        self.assertEqual(p.phase, "guided")
+        allowed, _ = allowed_ids(p, [10, THINK_START, 16])
+        self.assertEqual(p.phase, "reasoning")
+        self.assertEqual(allowed, set(range(V)))
+
+    def test_thinking_disabled_for_the_request_is_never_offered(self):
+        p = self.processor(offer_thinking=False)
+        allowed, _ = allowed_ids(p, [10])
+        self.assertEqual(allowed, {0})
+        with self.assertLogs(level="WARNING"):
+            allowed, _ = allowed_ids(p, [10, THINK_START])
+        self.assertEqual(allowed, {EOS})
 
     def test_declining_the_think_block_engages_the_grammar(self):
         p = self.processor()

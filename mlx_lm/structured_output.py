@@ -226,6 +226,7 @@ class GuidedLogitsProcessor:
         initial_state: str = "normal",
         think_start_tokens: Sequence[int] = (),
         think_end_tokens: Sequence[int] = (),
+        offer_thinking: bool = True,
         mask_cache_size: int = 512,
     ):
         if not OUTLINES_AVAILABLE:
@@ -239,8 +240,11 @@ class GuidedLogitsProcessor:
         self._think_end = tuple(int(t) for t in think_end_tokens)
         thinking = bool(self._think_start) and bool(self._think_end)
         self._phase = "reasoning" if (initial_state == "reasoning" and thinking) else "guided"
-        # From a normal start the model may still open a think block first.
-        self._think_offer = thinking and self._phase == "guided"
+        # From a normal start the model may still open a think block first,
+        # unless the request rendered its template with thinking disabled:
+        # offering the think-start token then lets a model that never reasons
+        # emit it as a stray token before the document (Gemma 4, 2026-09-13).
+        self._think_offer = thinking and self._phase == "guided" and bool(offer_thinking)
         self._think_progress = 0
         self._calls = 0
         self._broken = False
@@ -323,7 +327,16 @@ class GuidedLogitsProcessor:
 
         offering = self._think_offer and self._think_progress < len(self._think_start)
         terminal = self._phase == "done" or self._broken or self._guide.is_finished()
-        key = ("eos", vocab_size) if terminal else (self._guide.get_state(), vocab_size, offering)
+        # A multi-token think start (Gemma 4: <|channel> then "thought") offers a
+        # different token at each step of the sequence while the guide state
+        # stays put, so the offered position is part of the key; keying on the
+        # state alone served the first step's mask again at the second and let
+        # the model repeat the opening token, which then "left the grammar".
+        key = (
+            ("eos", vocab_size)
+            if terminal
+            else (self._guide.get_state(), vocab_size, self._think_progress if offering else -1)
+        )
         cached = self._mask_cache.get(key)
         if cached is not None:
             self._mask_cache.move_to_end(key)
@@ -342,8 +355,13 @@ def make_guided_processor(
     tokenizer,
     spec: Optional[ResponseFormatSpec],
     initial_state: str = "normal",
+    offer_thinking: bool = True,
 ) -> List[GuidedLogitsProcessor]:
-    """The extra logits processors a request needs (empty without a format)."""
+    """The extra logits processors a request needs (empty without a format).
+
+    `offer_thinking` is False when the request's chat template was rendered
+    with thinking disabled; the think-start token is then never allowed.
+    """
     if spec is None:
         return []
     index, max_token_id = cache.index_for(model_key, tokenizer, spec)
@@ -363,5 +381,6 @@ def make_guided_processor(
             think_end_tokens=(
                 getattr(tokenizer, "_think_end_tokens", ()) if has_thinking else ()
             ),
+            offer_thinking=offer_thinking,
         )
     ]

@@ -928,7 +928,22 @@ class ResponseGenerator:
             tokenizer,
             spec,
             initial_state=initial_state,
+            offer_thinking=self._request_thinking_enabled(args),
         )
+
+    def _request_thinking_enabled(self, args) -> bool:
+        """Whether this request's chat template was rendered with thinking on.
+
+        The server's --chat-template-args and the request's chat_template_kwargs
+        are the same values the template saw; a request that disabled thinking
+        must not be offered the think-start token by the grammar guide.
+        """
+        kwargs = dict(getattr(self.model_provider.cli_args, "chat_template_args", None) or {})
+        kwargs.update(getattr(args, "chat_template_kwargs", None) or {})
+        value = kwargs.get("enable_thinking", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in ("off", "false", "0", "no", "none", "")
+        return bool(value)
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
         """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
