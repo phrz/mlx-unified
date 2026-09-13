@@ -811,10 +811,6 @@ class ResponseGenerator:
                             "This model does not support image input "
                             "(no vision components for this checkpoint)."
                         )
-                    if self.model_provider.draft_model is not None:
-                        raise ValueError(
-                            "Image input is not supported with a draft model."
-                        )
                     rendered = tokenizer.apply_chat_template(
                         messages,
                         add_generation_prompt=True,
@@ -901,6 +897,22 @@ class ResponseGenerator:
             segment_types = ["assistant"]
 
         return prompt, segments, segment_types, initial_state
+
+    def _request_draft_model(self, request, args):
+        """The draft model THIS request decodes with, or None (mlx-unified).
+
+        x_speculative=false opts out. Image requests decode plainly too: the
+        draft/verify loops take token prompts, not the merged embeddings a
+        multimodal prompt prefills with, so the draft is skipped instead of
+        the request being refused.
+        """
+        draft_model = self.model_provider.draft_model
+        if draft_model is None or not getattr(args, "speculative", True):
+            return None
+        if getattr(request, "vision", None) is not None:
+            logging.info("image request: bypassing the draft model for this request")
+            return None
+        return draft_model
 
     def _structured_processors(self, args, tokenizer, initial_state):
         """Grammar processors for a request's response_format (mlx-unified)."""
@@ -1218,12 +1230,8 @@ class ResponseGenerator:
             # Load the model and tokenizer
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
-            # x_speculative=false: run THIS request undrafted (A/B benchmarking).
-            draft_model = (
-                self.model_provider.draft_model
-                if getattr(args, "speculative", True)
-                else None
-            )
+            # Chosen per request (x_speculative=false, images) after tokenizing.
+            draft_model = None
 
             # mlx-unified: delegated VLM families are rendered, tokenized and
             # generated wholesale by mlx-vlm — route before any of mlx_lm's
@@ -1248,6 +1256,7 @@ class ResponseGenerator:
                 raise StructuredOutputError(
                     "structured output is not supported for diffusion models"
                 )
+            draft_model = self._request_draft_model(request, args)
             # Built before the context is handed back so a bad schema is a 400.
             structured = self._structured_processors(args, tokenizer, initial_state)
             stop_matcher, text_sm = self._make_state_machine(
