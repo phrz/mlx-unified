@@ -50,6 +50,7 @@ from .multimodal import (
     load_vision_encoder,
     render_image_points,
 )
+from .loop_stop import LoopStop, parse_loop_stop
 from .sample_utils import make_logits_processors, make_sampler
 from .structured_output import (
     StructuredIndexCache,
@@ -273,6 +274,9 @@ class GenerationArguments:
     speculative: bool = True
     # mlx-unified: a compiled `response_format` (structured_output.ResponseFormatSpec).
     structured_output: Optional[Any] = None
+    # mlx-unified: x_loop_stop (loop_stop.LoopStopOptions) ends a reply that has
+    # fallen into a verbatim loop, with finish_reason "loop".
+    loop_stop: Optional[Any] = None
 
 
 @dataclass
@@ -1462,6 +1466,7 @@ class ResponseGenerator:
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
+            loop_stop = LoopStop(args.loop_stop) if args.loop_stop is not None else None
             for gen in stream_generate(
                 model=model,
                 tokenizer=gen_tokenizer,
@@ -1485,6 +1490,10 @@ class ResponseGenerator:
                 )
                 if matched:
                     finish_reason = "stop"
+                # mlx-unified: a reply looping verbatim ends here (x_loop_stop).
+                if finish_reason is None and loop_stop is not None and loop_stop.feed(gen.text):
+                    logging.info("x_loop_stop: the reply repeated itself; ended after %d characters", len(loop_stop.text))
+                    finish_reason = "loop"
                 if point_text is not None:
                     point_text += gen.text
                 rqueue.put(
@@ -2081,6 +2090,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # tolerated and ignored for every other model.
         self.x_stream_draft_blocks = self.body.get("x_stream_draft_blocks", False)
         self.x_speculative = bool(self.body.get("x_speculative", True))
+        # Parsed in validate_model_parameters, where a bad value is a 400.
+        self.x_loop_stop = self.body.get("x_loop_stop")
         self.response_format = self.body.get("response_format")
         try:
             self.validate_model_parameters()
@@ -2127,6 +2138,8 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
+        # mlx-unified: true or an object of options; anything else is a 400.
+        self.x_loop_stop = parse_loop_stop(self.x_loop_stop)
         self._validate("max_tokens", int, min_val=0)
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
@@ -2341,6 +2354,7 @@ class APIHandler(BaseHTTPRequestHandler):
             stream_draft_blocks=self.stream and self.x_stream_draft_blocks,
             speculative=self.x_speculative,
             structured_output=self.structured_output,
+            loop_stop=self.x_loop_stop,
         )
 
         # Keep connection allive during long prompt processing (and also log
